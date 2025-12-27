@@ -1,6 +1,6 @@
 use embassy_net::{Stack, dns::DnsQueryType, tcp::TcpSocket};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
-use embassy_time::Duration;
+use embassy_time::{Duration, Timer};
 
 use crate::{MQTT_LOGIN, MQTT_PASSWORD, MQTT_SERVER, RX_BUFFER_SIZE, TX_BUFFER_SIZE};
 
@@ -8,7 +8,7 @@ use log::{info, warn};
 
 use rust_mqtt::{
     client::{client::MqttClient, client_config::ClientConfig as MqttClientConfig},
-    packet::v5::publish_packet::QualityOfService::QoS1,
+    packet::v5::publish_packet::QualityOfService::QoS0,
     utils::rng_generator::CountingRng,
 };
 
@@ -77,7 +77,7 @@ impl Mqtt {
             let writebuf_len = writebuf.len();
             let readbuf_len = readbuf.len();
             MqttClient::<_, 5, _>::new(
-                socket,
+                &mut socket,
                 &mut writebuf,
                 writebuf_len,
                 &mut readbuf,
@@ -94,7 +94,7 @@ impl Mqtt {
         info!("Connected to MQTT broker");
 
         client
-            .send_message(topic, data.as_bytes(), QoS1, false)
+            .send_message(topic, data.as_bytes(), QoS0, false)
             .await
             .map_err(|_| Error::PublishFailed)?;
 
@@ -104,6 +104,10 @@ impl Mqtt {
             .disconnect()
             .await
             .map_err(|_| Error::DisconnectFailed)?;
+
+        socket.close();
+        // Give stack some time to process the socket closure
+        Timer::after(Duration::from_millis(100)).await;
 
         Ok(())
     }
