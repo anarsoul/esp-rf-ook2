@@ -185,7 +185,7 @@ async fn main(spawner: Spawner) -> ! {
                                 .unwrap_or_else(|e| {
                                     warn!("Failed to publish MQTT message: {:?}", e)
                                 });
-                        } else {
+                        } else if measurement_cnt < 3 {
                             measurement_cnt += 1;
                         }
                     }
