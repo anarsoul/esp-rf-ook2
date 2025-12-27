@@ -1,6 +1,6 @@
 use esp_hal::gpio::Level;
 use esp_hal::rmt::PulseCode;
-use log::{info, warn};
+use log::warn;
 
 pub const PAYLOAD_LEN: usize = 36;
 
@@ -18,7 +18,70 @@ pub enum DecodeError {
     SampleOutOfRange(u16),
     PulseOutOfRange(u16),
     WrongChannel(u8),
-    TempOutOfRange(&'static str, i32),
+    TempOutOfRange(i32, i32),
+}
+
+#[derive(Debug)]
+pub struct Parsed {
+    model: [u8; 32],
+    pub sign: i32,
+    pub temp_int: i32,
+    pub temp_decimal: i32,
+    pub humidity: i32,
+    pub battery_ok: u8,
+    pub channel: u8,
+    pub id: u8,
+}
+
+impl Default for Parsed {
+    fn default() -> Self {
+        Parsed::new("Unknown", 1, 10, 0, 80, 1, 0, 0)
+    }
+}
+
+impl Parsed {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        model: &str,
+        sign: i32,
+        temp_int: i32,
+        temp_decimal: i32,
+        humidity: i32,
+        battery_ok: u8,
+        channel: u8,
+        id: u8,
+    ) -> Self {
+        let mut model_arr = [0u8; 32];
+        let bytes = model.as_bytes();
+        let len = bytes.len().min(32);
+        model_arr[..len].copy_from_slice(&bytes[..len]);
+        Parsed {
+            model: model_arr,
+            sign,
+            temp_int,
+            temp_decimal,
+            humidity,
+            battery_ok,
+            channel,
+            id,
+        }
+    }
+    pub fn model(&self) -> &str {
+        let len = self
+            .model
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.model.len());
+
+        str::from_utf8(&self.model[..len]).unwrap_or("")
+    }
+
+    pub fn equal(&self, a: &Parsed) -> bool {
+        self.sign == a.sign
+            && self.temp_int == a.temp_int
+            && self.temp_decimal == a.temp_decimal
+            && self.humidity == a.humidity
+    }
 }
 
 fn decode_range(samples: &[u16], start: usize, size: usize) -> Result<u32, DecodeError> {
@@ -37,7 +100,7 @@ fn decode_range(samples: &[u16], start: usize, size: usize) -> Result<u32, Decod
     Ok(value)
 }
 
-pub fn decode(pulses: &[PulseCode], ch: u8, len: usize) -> Result<(), DecodeError> {
+pub fn decode(pulses: &[PulseCode], ch: u8, len: usize) -> Result<Parsed, DecodeError> {
     // Currently we support only Nexus-TH which has 36 bit of payload
     if len != PAYLOAD_LEN + 1 {
         return Err(DecodeError::WrongPayloadLen(len));
@@ -68,11 +131,11 @@ pub fn decode(pulses: &[PulseCode], ch: u8, len: usize) -> Result<(), DecodeErro
         };
     }
 
-    let mut sign = "";
+    let mut sign = 1;
     let mut temp_10x: i32 = decode_range(&samples, 12, 12)? as i32;
     // Handle negative temp
     if temp_10x > 2048 {
-        sign = "-";
+        sign = -1;
         temp_10x = 4096 - temp_10x;
     }
     let temp_int = temp_10x / 10;
@@ -95,10 +158,16 @@ pub fn decode(pulses: &[PulseCode], ch: u8, len: usize) -> Result<(), DecodeErro
         return Err(DecodeError::WrongChannel(channel));
     }
 
-    info!(
-        "Temp: {}{}.{}, humidity: {}, channel: {}, ID: {}, battery_ok: {}",
-        sign, temp_int, temp_decimal, humidity, channel, id, battery_ok
+    let res = Parsed::new(
+        "Nexus-TH",
+        sign,
+        temp_int,
+        temp_decimal,
+        humidity,
+        battery_ok,
+        channel,
+        id,
     );
 
-    Ok(())
+    Ok(res)
 }

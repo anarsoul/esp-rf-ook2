@@ -14,6 +14,10 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   SSID: testssid
   PASSWORD: testpassword
+  MQTT_SERVER: mqtt.lan
+  MQTT_LOGIN: testlogin
+  MQTT_PASSWORD: testpassword
+  MQTT_TOPIC: sensors
 
 jobs:
   rust-checks:
@@ -38,6 +42,7 @@ jobs:
           default: true
           buildtargets: esp32
           ldproxy: false
+          version: "1.92.0"
       - name: Enable caching
         uses: Swatinem/rust-cache@v2
       - name: Run command

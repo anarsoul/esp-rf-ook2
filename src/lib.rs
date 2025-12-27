@@ -1,8 +1,11 @@
 #![no_std]
 
 pub mod decoder;
+pub mod mqtt;
 pub mod ntpc;
 pub mod wifi;
+
+extern crate alloc;
 
 pub const RX_BUFFER_SIZE: usize = 4096;
 pub const TX_BUFFER_SIZE: usize = 4096;
@@ -10,7 +13,14 @@ pub const TX_BUFFER_SIZE: usize = 4096;
 pub const SSID: &str = env!("SSID");
 pub const PASSWORD: &str = env!("PASSWORD");
 
-const NTP_SERVER: &str = "pool.ntp.org";
+pub const NTP_SERVER: &str = "pool.ntp.org";
+pub const TIMEZONE: &str = "UTC";
+
+pub const MQTT_SERVER: &str = env!("MQTT_SERVER");
+pub const MQTT_LOGIN: &str = env!("MQTT_LOGIN");
+pub const MQTT_PASSWORD: &str = env!("MQTT_PASSWORD");
+
+pub const MQTT_TOPIC: &str = env!("MQTT_TOPIC");
 
 #[unsafe(no_mangle)]
 pub fn custom_halt() -> ! {

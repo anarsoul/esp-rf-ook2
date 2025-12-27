@@ -22,7 +22,8 @@ use esp_radio::Controller;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
 use log::{info, warn};
 
-use esp_rf_ook2::decoder::{DecodeError, decode};
+use esp_rf_ook2::decoder::{DecodeError, Parsed, decode};
+use esp_rf_ook2::mqtt::Mqtt;
 use esp_rf_ook2::ntpc::Ntpc;
 use esp_rf_ook2::wifi::Wifi;
 use esp_rf_ook2::{RX_BUFFER_SIZE, TX_BUFFER_SIZE};
@@ -32,12 +33,16 @@ use embassy_net::Stack;
 
 use static_cell::StaticCell;
 
+use alloc::format;
+
+extern crate alloc;
+
 // When you are okay with using a nightly compiler it's better to use https://docs.rs/static_cell/2.1.0/static_cell/macro.make_static.html
 macro_rules! mk_static {
     ($t:ty,$val:expr) => {{
         static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
         #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
+        let x = STATIC_CELL.uninit().write($val);
         x
     }};
 }
@@ -49,8 +54,6 @@ esp_bootloader_esp_idf::esp_app_desc!();
 static RX_BUF: StaticCell<Mutex<NoopRawMutex, [u8; RX_BUFFER_SIZE]>> = StaticCell::new();
 static TX_BUF: StaticCell<Mutex<NoopRawMutex, [u8; TX_BUFFER_SIZE]>> = StaticCell::new();
 static SHARED_STACK: StaticCell<Mutex<NoopRawMutex, Stack<'static>>> = StaticCell::new();
-
-const TIMEZONE: jiff::tz::TimeZone = jiff::tz::get!("America/Vancouver");
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -106,9 +109,7 @@ async fn main(spawner: Spawner) -> ! {
     rtc.set_current_time_us(time * 1_000_000);
 
     let mut last_time = rtc.current_time_us();
-    let last_ts = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64)
-        .unwrap()
-        .to_zoned(TIMEZONE);
+    let last_ts = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
 
     info!("now is {last_ts}");
 
@@ -126,6 +127,12 @@ async fn main(spawner: Spawner) -> ! {
         .expect("Failed to configure RMT RX channel");
     let mut data: [PulseCode; 64] = [PulseCode::default(); 64];
 
+    let mut mqtt = Mqtt::new(shared_stack, rx_buf, tx_buf);
+
+    let mut measurement = Parsed::default();
+    let mut measurement_cnt = 0;
+    let mut last_publish = rtc.current_time_us();
+
     loop {
         // Re-sync time every 10_000 seconds (~2.7 hours)
         if rtc.current_time_us() - last_time > 10_000_000_000 {
@@ -133,9 +140,7 @@ async fn main(spawner: Spawner) -> ! {
             let time = ntpc.get_time().await.expect("Failed to get NTP time");
             rtc.set_current_time_us(time * 1_000_000);
             last_time = rtc.current_time_us();
-            let last_ts = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64)
-                .unwrap()
-                .to_zoned(TIMEZONE);
+            let last_ts = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
 
             info!("now is {last_ts}");
         }
@@ -148,17 +153,50 @@ async fn main(spawner: Spawner) -> ! {
         //
         // On ESP32 RMT can count the lenght of pulses for us, simplifying the decoding
         match channel.receive(&mut data).await {
-            Ok(symbol_count) => {
-                let res = decode(&data, 1, symbol_count);
-                if res.is_err() {
-                    match res.as_ref().err().unwrap() {
-                        DecodeError::WrongPayloadLen(_len) => {}
-                        _ => {
-                            warn!("Decode error: {:?}", res.err().unwrap());
+            Ok(symbol_count) => match decode(&data, 1, symbol_count) {
+                Ok(parsed) => {
+                    info!("{:?}", parsed);
+                    if !measurement.equal(&parsed) {
+                        measurement = parsed;
+                        measurement_cnt = 1;
+                    } else {
+                        let now = rtc.current_time_us();
+                        if measurement_cnt == 3 && now - last_publish > 1_000_000 {
+                            info!("Publishing...");
+                            last_publish = now;
+                            let date_time = jiff::Timestamp::from_microsecond(now as i64)
+                                .unwrap()
+                                .strftime("%Y-%m-%d %H:%M:%S UTC");
+                            let topic = format!("sensors/{}", parsed.model());
+                            let data = format!(
+                                "{{\"time\" : \"{}\", \"model\" : \"{}\", \"id\" : {}, \"channel\" : {}, \"battery_ok\" : {}, \"temperature_C\" : {}{}.{}, \"humidity\" : {} }}",
+                                date_time,
+                                parsed.model(),
+                                parsed.id,
+                                parsed.channel,
+                                parsed.battery_ok,
+                                { if parsed.sign < 0 { "-" } else { "" } },
+                                parsed.temp_int,
+                                parsed.temp_decimal,
+                                parsed.humidity
+                            );
+                            mqtt.publish(topic.as_str(), data.as_str())
+                                .await
+                                .unwrap_or_else(|e| {
+                                    warn!("Failed to publish MQTT message: {:?}", e)
+                                });
+                        } else {
+                            measurement_cnt += 1;
                         }
                     }
                 }
-            }
+                Err(e) => match e {
+                    DecodeError::WrongPayloadLen(_len) => {}
+                    _ => {
+                        warn!("Decode error: {:?}", e);
+                    }
+                },
+            },
             Err(_e) => {}
         }
     }
