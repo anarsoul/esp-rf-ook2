@@ -16,7 +16,7 @@ use esp_hal::rmt::{PulseCode, Rmt, RxChannelConfig, RxChannelCreator};
 use esp_hal::rng::Rng;
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::time::Rate;
-use esp_hal::timer::timg::{MwdtStage, TimerGroup, Wdt};
+use esp_hal::timer::timg::{MwdtStage, TimerGroup};
 use esp_radio::Controller;
 
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
@@ -70,10 +70,10 @@ async fn main(spawner: Spawner) -> ! {
     let mut wdt = timg0.wdt;
     wdt.set_timeout(
         MwdtStage::Stage0,
-        esp_hal::time::Duration::from_millis(5_000),
+        esp_hal::time::Duration::from_millis(30_000),
     );
     wdt.enable();
-    spawner.spawn(watchdog_feeder(wdt)).ok();
+    wdt.feed();
 
     let rtc = Rtc::new(peripherals.LPWR);
     let radio_init = &*mk_static!(
@@ -84,12 +84,15 @@ async fn main(spawner: Spawner) -> ! {
         .await
         .expect("Failed to initialize Wi-Fi");
 
+    wdt.feed();
+
     let shared_stack = SHARED_STACK.init(Mutex::new(wifi.stack));
     // Sockets cannot share the buffers, so users have to make sure that the socket is
     // closed before releasing the mutex.
     let rx_buf = RX_BUF.init(Mutex::new([0; RX_BUFFER_SIZE]));
     let tx_buf = TX_BUF.init(Mutex::new([0; TX_BUFFER_SIZE]));
 
+    wdt.feed();
     let a = wifi.wait_for_ip();
     let b = Timer::after(Duration::from_secs(20));
 
@@ -103,6 +106,7 @@ async fn main(spawner: Spawner) -> ! {
         }
     }
 
+    wdt.feed();
     let mut ntpc = Ntpc::new(shared_stack, rx_buf, tx_buf);
 
     let time = ntpc.get_time().await.expect("Failed to get NTP time");
@@ -134,6 +138,7 @@ async fn main(spawner: Spawner) -> ! {
     let mut last_publish = rtc.current_time_us();
 
     loop {
+        wdt.feed();
         // Re-sync time every 10_000 seconds (~2.7 hours)
         if rtc.current_time_us() - last_time > 10_000_000_000 {
             info!("Re-syncing time via NTP...");
@@ -152,7 +157,18 @@ async fn main(spawner: Spawner) -> ! {
         // 1 is 1650-2150 uS, 0 is 800-1100 uS
         //
         // On ESP32 RMT can count the lenght of pulses for us, simplifying the decoding
-        match channel.receive(&mut data).await {
+        let a = channel.receive(&mut data);
+        let b = Timer::after(Duration::from_secs(1));
+
+        let either = select(a, b).await;
+        wdt.feed();
+        let res = match either {
+            Either::First(res) => res,
+            Either::Second(_) => {
+                continue;
+            }
+        };
+        match res {
             Ok(symbol_count) => match decode(&data, 1, symbol_count) {
                 Ok(parsed) => {
                     info!("{:?}", parsed);
@@ -199,13 +215,5 @@ async fn main(spawner: Spawner) -> ! {
             },
             Err(_e) => {}
         }
-    }
-}
-
-#[embassy_executor::task]
-async fn watchdog_feeder(mut wdt: Wdt<esp_hal::peripherals::TIMG0<'static>>) {
-    loop {
-        wdt.feed();
-        Timer::after(Duration::from_millis(1000)).await;
     }
 }
