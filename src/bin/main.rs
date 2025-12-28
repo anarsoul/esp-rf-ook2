@@ -150,6 +150,12 @@ async fn main(spawner: Spawner) -> ! {
             info!("now is {last_ts}");
         }
 
+        if rtc.current_time_us() - last_publish > 360_000_000 {
+            // Last successful publish was over 5 minutes ago, so something is wrong.
+            // Panic and trigger watchdog reload to recover
+            panic!("No successful publishes in 360 seconds!");
+        }
+
         // Receive the data as series of PulseCode. For Nexus-TH, it will be
         // 36 symbols + terminator. High pulse (carrier present) has a fixed width of
         // 350-650 uS (actual width likely depends on battery voltage),
@@ -177,9 +183,8 @@ async fn main(spawner: Spawner) -> ! {
                         measurement_cnt = 1;
                     } else {
                         let now = rtc.current_time_us();
-                        if measurement_cnt == 3 && now - last_publish > 1_000_000 {
+                        if measurement_cnt == 3 && now - last_publish > 5_000_000 {
                             info!("Publishing...");
-                            last_publish = now;
                             let date_time = jiff::Timestamp::from_microsecond(now as i64)
                                 .unwrap()
                                 .strftime("%Y-%m-%d %H:%M:%S UTC");
@@ -196,11 +201,14 @@ async fn main(spawner: Spawner) -> ! {
                                 parsed.temp_decimal,
                                 parsed.humidity
                             );
-                            mqtt.publish(topic.as_str(), data.as_str())
-                                .await
-                                .unwrap_or_else(|e| {
-                                    warn!("Failed to publish MQTT message: {:?}", e)
-                                });
+                            match mqtt.publish(topic.as_str(), data.as_str()).await {
+                                Ok(_) => {
+                                    last_publish = now;
+                                }
+                                Err(e) => {
+                                    warn!("Failed to publish MQTT message: {:?}", e);
+                                }
+                            };
                         } else if measurement_cnt < 3 {
                             measurement_cnt += 1;
                         }
