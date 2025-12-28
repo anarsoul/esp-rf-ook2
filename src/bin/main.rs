@@ -177,7 +177,13 @@ async fn main(spawner: Spawner) -> ! {
         match res {
             Ok(symbol_count) => match decode(&data, 1, symbol_count) {
                 Ok(parsed) => {
-                    info!("{:?}", parsed);
+                    info!(
+                        "Temperature: {}{}.{}C, Humidity: {}%",
+                        { if parsed.sign < 0 { "-" } else { "" } },
+                        parsed.temp_int,
+                        parsed.temp_decimal,
+                        parsed.humidity
+                    );
                     if !measurement.equal(&parsed) {
                         measurement = parsed;
                         measurement_cnt = 1;
@@ -204,6 +210,10 @@ async fn main(spawner: Spawner) -> ! {
                             match mqtt.publish(topic.as_str(), data.as_str()).await {
                                 Ok(_) => {
                                     last_publish = now;
+                                    info!(
+                                        "Published at {}",
+                                        jiff::Timestamp::from_microsecond(now as i64).unwrap()
+                                    );
                                 }
                                 Err(e) => {
                                     warn!("Failed to publish MQTT message: {:?}", e);
