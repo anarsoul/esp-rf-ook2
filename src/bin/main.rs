@@ -22,7 +22,7 @@ use esp_radio::Controller;
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
 use log::{info, warn};
 
-use esp_rf_ook2::decoder::{DecodeError, Parsed, decode};
+use esp_rf_ook2::decoder::{DecodeError, SensorData, decode};
 use esp_rf_ook2::mqtt::Mqtt;
 use esp_rf_ook2::ntpc::Ntpc;
 use esp_rf_ook2::wifi::Wifi;
@@ -133,7 +133,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let mut mqtt = Mqtt::new(shared_stack, rx_buf, tx_buf);
 
-    let mut measurement = Parsed::default();
+    let mut measurement = SensorData::default();
     let mut measurement_cnt = 0;
     let mut last_publish = rtc.current_time_us();
 

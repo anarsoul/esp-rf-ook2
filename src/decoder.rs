@@ -1,8 +1,10 @@
 use esp_hal::gpio::Level;
 use esp_hal::rmt::PulseCode;
-use log::warn;
+use packed_struct::prelude::*;
 
-pub const PAYLOAD_LEN: usize = 36;
+pub const PAYLOAD_LEN_BITS: usize = 36;
+// Payload is 36 bits, 36 / 5 = 4.5 bytes, round up to 5 bytes
+pub const PAYLOAD_LEN_BYTES: usize = 5;
 
 pub const PULSE_MIN: u16 = 300; // us
 pub const PULSE_MAX: u16 = 650; // us
@@ -18,36 +20,37 @@ pub enum DecodeError {
     SampleOutOfRange(u16),
     PulseOutOfRange(u16),
     WrongChannel(u8),
-    TempOutOfRange(i32, i32),
+    TempOutOfRange(i8, u16),
+    UnpackFailed,
 }
 
 #[derive(Debug)]
-pub struct Parsed {
+pub struct SensorData {
     model: [u8; 32],
-    pub sign: i32,
-    pub temp_int: i32,
-    pub temp_decimal: i32,
-    pub humidity: i32,
-    pub battery_ok: u8,
+    pub sign: i8,
+    pub temp_int: u16,
+    pub temp_decimal: u16,
+    pub humidity: u8,
+    pub battery_ok: bool,
     pub channel: u8,
     pub id: u8,
 }
 
-impl Default for Parsed {
+impl Default for SensorData {
     fn default() -> Self {
-        Parsed::new("Unknown", 1, 10, 0, 80, 1, 0, 0)
+        SensorData::new("Unknown", 1, 10, 0, 80, true, 0, 0)
     }
 }
 
-impl Parsed {
+impl SensorData {
     #[allow(clippy::too_many_arguments)]
     fn new(
         model: &str,
-        sign: i32,
-        temp_int: i32,
-        temp_decimal: i32,
-        humidity: i32,
-        battery_ok: u8,
+        sign: i8,
+        temp_int: u16,
+        temp_decimal: u16,
+        humidity: u8,
+        battery_ok: bool,
         channel: u8,
         id: u8,
     ) -> Self {
@@ -55,7 +58,7 @@ impl Parsed {
         let bytes = model.as_bytes();
         let len = bytes.len().min(32);
         model_arr[..len].copy_from_slice(&bytes[..len]);
-        Parsed {
+        SensorData {
             model: model_arr,
             sign,
             temp_int,
@@ -76,7 +79,7 @@ impl Parsed {
         str::from_utf8(&self.model[..len]).unwrap_or("")
     }
 
-    pub fn equal(&self, a: &Parsed) -> bool {
+    pub fn equal(&self, a: &SensorData) -> bool {
         self.sign == a.sign
             && self.temp_int == a.temp_int
             && self.temp_decimal == a.temp_decimal
@@ -84,25 +87,59 @@ impl Parsed {
     }
 }
 
-fn decode_range(samples: &[u16], start: usize, size: usize) -> Result<u32, DecodeError> {
-    let mut value: u32 = 0;
-    for sample in &samples[start..start + size] {
-        if (MIN_HIGH..MAX_HIGH).contains(sample) {
-            value <<= 1;
-            value |= 1;
-        } else if (MIN_LOW..MAX_LOW).contains(sample) {
-            value <<= 1;
-        } else {
-            warn!("Range: {} - {}", start, start + size);
-            return Err(DecodeError::SampleOutOfRange(*sample));
+impl From<NexusTHPayload> for SensorData {
+    fn from(pld: NexusTHPayload) -> Self {
+        let mut sign = 1;
+        let mut temp_10x: u16 = pld.temp_10x.into();
+        // Handle negative temp
+        if temp_10x > 2048 {
+            sign = -1;
+            temp_10x = 4096 - temp_10x;
         }
+        let temp_int: u16 = temp_10x / 10;
+        let temp_decimal: u16 = temp_10x % 10;
+
+        let mut humidity: u8 = pld.humidity.into();
+        // Clamp humidity
+        if humidity > 100 {
+            humidity = 100;
+        }
+
+        SensorData::new(
+            "Nexus-TH",
+            sign,
+            temp_int,
+            temp_decimal,
+            humidity,
+            pld.battery_ok,
+            pld.channel.into(),
+            pld.id.into(),
+        )
     }
-    Ok(value)
 }
 
-pub fn decode(pulses: &[PulseCode], ch: u8, len: usize) -> Result<Parsed, DecodeError> {
-    // Currently we support only Nexus-TH which has 36 bit of payload
-    if len != PAYLOAD_LEN + 1 {
+#[derive(PackedStruct, Debug)]
+#[packed_struct(bit_numbering = "msb0")]
+struct NexusTHPayload {
+    #[packed_field(bits = "0:7")]
+    id: Integer<u8, packed_bits::Bits<8>>,
+    #[packed_field(bits = "8:8")]
+    battery_ok: bool,
+    #[packed_field(bits = "9:9")]
+    _unknown_0: Integer<u8, packed_bits::Bits<1>>,
+    #[packed_field(bits = "10:11")]
+    channel: Integer<u8, packed_bits::Bits<2>>,
+    #[packed_field(endian = "msb", bits = "12:23")]
+    temp_10x: Integer<u16, packed_bits::Bits<12>>,
+    #[packed_field(bits = "24:27")]
+    _unknown_1: Integer<u8, packed_bits::Bits<4>>,
+    #[packed_field(bits = "28:35")]
+    humidity: Integer<u8, packed_bits::Bits<8>>,
+}
+
+pub fn decode(pulses: &[PulseCode], ch: u8, len: usize) -> Result<SensorData, DecodeError> {
+    // len should be number of bits + terminator
+    if len != PAYLOAD_LEN_BITS + 1 {
         return Err(DecodeError::WrongPayloadLen(len));
     }
 
@@ -119,9 +156,9 @@ pub fn decode(pulses: &[PulseCode], ch: u8, len: usize) -> Result<Parsed, Decode
         }
     }
 
-    let mut samples: [u16; PAYLOAD_LEN + 1] = [0; PAYLOAD_LEN + 1];
+    let mut samples: [u16; PAYLOAD_LEN_BITS] = [0; PAYLOAD_LEN_BITS];
     for (idx, entry) in pulses.iter().enumerate() {
-        if idx == len {
+        if idx == len || idx == PAYLOAD_LEN_BITS {
             break;
         }
         samples[idx] = if let Level::Low = entry.level1() {
@@ -131,43 +168,28 @@ pub fn decode(pulses: &[PulseCode], ch: u8, len: usize) -> Result<Parsed, Decode
         };
     }
 
-    let mut sign = 1;
-    let mut temp_10x: i32 = decode_range(&samples, 12, 12)? as i32;
-    // Handle negative temp
-    if temp_10x > 2048 {
-        sign = -1;
-        temp_10x = 4096 - temp_10x;
-    }
-    let temp_int = temp_10x / 10;
-    let temp_decimal = temp_10x % 10;
-
-    if !(0..60).contains(&temp_int) {
-        return Err(DecodeError::TempOutOfRange(sign, temp_int));
+    let mut decoded: [u8; PAYLOAD_LEN_BYTES] = [0; PAYLOAD_LEN_BYTES];
+    for (idx, value) in samples.iter().enumerate() {
+        if (MIN_HIGH..MAX_HIGH).contains(value) {
+            decoded[idx / 8] |= 1 << (7 - idx % 8);
+        } else if (MIN_LOW..MAX_LOW).contains(value) {
+            decoded[idx / 8] &= !(1 << (7 - idx % 8));
+        } else {
+            return Err(DecodeError::SampleOutOfRange(*value));
+        }
     }
 
-    let mut humidity: i32 = decode_range(&samples, 28, 8)? as i32;
-    // Clamp humidity
-    if humidity > 100 {
-        humidity = 100;
-    }
-    let battery_ok: u8 = decode_range(&samples, 8, 1)? as u8;
-    let channel: u8 = (decode_range(&samples, 10, 2)? + 1) as u8;
-    let id: u8 = decode_range(&samples, 0, 8)? as u8;
+    let unpacked = NexusTHPayload::unpack(&decoded).map_err(|_| DecodeError::UnpackFailed)?;
 
-    if ch != channel {
-        return Err(DecodeError::WrongChannel(channel));
+    let res: SensorData = unpacked.into();
+
+    if !(0..60).contains(&res.temp_int) {
+        return Err(DecodeError::TempOutOfRange(res.sign, res.temp_int));
     }
 
-    let res = Parsed::new(
-        "Nexus-TH",
-        sign,
-        temp_int,
-        temp_decimal,
-        humidity,
-        battery_ok,
-        channel,
-        id,
-    );
+    if ch != res.channel {
+        return Err(DecodeError::WrongChannel(res.channel));
+    }
 
     Ok(res)
 }
