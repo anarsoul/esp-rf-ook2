@@ -237,7 +237,6 @@ async fn main(spawner: Spawner) -> ! {
                     } else {
                         let now = rtc.current_time_us();
                         if measurement_cnt == 3 && now - last_publish > 5_000_000 {
-                            info!("Passing data to MQTT sender...");
                             MQTT_CHANNEL.send((parsed, now as i64)).await;
                             last_publish = now;
                         } else if measurement_cnt < 3 {

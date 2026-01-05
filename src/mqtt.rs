@@ -4,7 +4,7 @@ use embassy_time::{Duration, Timer};
 
 use crate::{MQTT_LOGIN, MQTT_PASSWORD, MQTT_SERVER, RX_BUFFER_SIZE, TX_BUFFER_SIZE};
 
-use log::{info, warn};
+use log::{debug, warn};
 
 use rust_mqtt::{
     client::{client::MqttClient, client_config::ClientConfig as MqttClientConfig},
@@ -91,19 +91,22 @@ impl Mqtt {
             Error::ConnectionFailed
         })?;
 
-        info!("Connected to MQTT broker");
+        debug!("Connected to MQTT broker");
 
         client
             .send_message(topic, data.as_bytes(), QoS0, false)
             .await
-            .map_err(|_| Error::PublishFailed)?;
+            .map_err(|e| {
+                warn!("Error: {:?}", e);
+                Error::PublishFailed
+            })?;
 
-        info!("Published to topic {}", topic);
+        debug!("Published to topic {}", topic);
 
-        client
-            .disconnect()
-            .await
-            .map_err(|_| Error::DisconnectFailed)?;
+        client.disconnect().await.map_err(|e| {
+            warn!("Error: {:?}", e);
+            Error::DisconnectFailed
+        })?;
 
         socket.close();
         // Give stack some time to process the socket closure
