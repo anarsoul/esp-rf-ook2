@@ -19,7 +19,11 @@ use esp_hal::time::Rate;
 use esp_hal::timer::timg::{MwdtStage, TimerGroup};
 use esp_radio::Controller;
 
-use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
+use embassy_sync::channel::Channel;
+use embassy_sync::{
+    blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
+    mutex::Mutex,
+};
 use log::{info, warn};
 
 use esp_rf_ook2::decoder::{DecodeError, SensorData, decode};
@@ -54,6 +58,52 @@ esp_bootloader_esp_idf::esp_app_desc!();
 static RX_BUF: StaticCell<Mutex<NoopRawMutex, [u8; RX_BUFFER_SIZE]>> = StaticCell::new();
 static TX_BUF: StaticCell<Mutex<NoopRawMutex, [u8; TX_BUFFER_SIZE]>> = StaticCell::new();
 static SHARED_STACK: StaticCell<Mutex<NoopRawMutex, Stack<'static>>> = StaticCell::new();
+
+static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, (SensorData, i64), 2> = Channel::new();
+
+#[embassy_executor::task]
+async fn mqtt_publisher(mqtt: &'static mut Mqtt, now: i64) {
+    let mut last_publish: i64 = now;
+    loop {
+        let (data, timestamp) = MQTT_CHANNEL.receive().await;
+
+        if timestamp - last_publish > 360_000_000 {
+            // Last successful publish was over 5 minutes ago, so something is wrong.
+            // Panic and trigger watchdog reload to recover
+            panic!("No successful publishes in 360 seconds!");
+        }
+
+        info!("Publishing...");
+        let date_time = jiff::Timestamp::from_microsecond(timestamp)
+            .unwrap()
+            .strftime("%Y-%m-%d %H:%M:%S UTC");
+        let topic = format!("sensors/{}", data.model());
+        let data = format!(
+            "{{\"time\" : \"{}\", \"model\" : \"{}\", \"id\" : {}, \"channel\" : {}, \"battery_ok\" : {}, \"temperature_C\" : {}{}.{}, \"humidity\" : {} }}",
+            date_time,
+            data.model(),
+            data.id,
+            data.channel,
+            data.battery_ok,
+            { if data.sign < 0 { "-" } else { "" } },
+            data.temp_int,
+            data.temp_decimal,
+            data.humidity
+        );
+        match mqtt.publish(topic.as_str(), data.as_str()).await {
+            Ok(_) => {
+                last_publish = timestamp;
+                info!(
+                    "Published at {}",
+                    jiff::Timestamp::from_microsecond(timestamp).unwrap()
+                );
+            }
+            Err(e) => {
+                warn!("Failed to publish MQTT message: {:?}", e);
+            }
+        };
+    }
+}
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
@@ -112,10 +162,10 @@ async fn main(spawner: Spawner) -> ! {
     let time = ntpc.get_time().await.expect("Failed to get NTP time");
     rtc.set_current_time_us(time * 1_000_000);
 
-    let mut last_time = rtc.current_time_us();
-    let last_ts = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
+    let mut last_time_sync = rtc.current_time_us();
+    let now = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
 
-    info!("now is {last_ts}");
+    info!("now is {now}");
 
     let freq = Rate::from_mhz(80);
 
@@ -131,7 +181,10 @@ async fn main(spawner: Spawner) -> ! {
         .expect("Failed to configure RMT RX channel");
     let mut data: [PulseCode; 64] = [PulseCode::default(); 64];
 
-    let mut mqtt = Mqtt::new(shared_stack, rx_buf, tx_buf);
+    let mqtt = &mut *mk_static!(Mqtt, Mqtt::new(shared_stack, rx_buf, tx_buf));
+    spawner
+        .spawn(mqtt_publisher(mqtt, rtc.current_time_us() as i64))
+        .expect("Failed to spawn MQTT sender task");
 
     let mut measurement = SensorData::default();
     let mut measurement_cnt = 0;
@@ -140,20 +193,14 @@ async fn main(spawner: Spawner) -> ! {
     loop {
         wdt.feed();
         // Re-sync time every 3_600 seconds (1 hour)
-        if rtc.current_time_us() - last_time > 3_600_000_000 {
+        if rtc.current_time_us() - last_time_sync > 3_600_000_000 {
             info!("Re-syncing time via NTP...");
             let time = ntpc.get_time().await.expect("Failed to get NTP time");
             rtc.set_current_time_us(time * 1_000_000);
-            last_time = rtc.current_time_us();
+            last_time_sync = rtc.current_time_us();
             let last_ts = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
 
             info!("now is {last_ts}");
-        }
-
-        if rtc.current_time_us() - last_publish > 360_000_000 {
-            // Last successful publish was over 5 minutes ago, so something is wrong.
-            // Panic and trigger watchdog reload to recover
-            panic!("No successful publishes in 360 seconds!");
         }
 
         // Receive the data as series of PulseCode. For Nexus-TH, it will be
@@ -190,35 +237,9 @@ async fn main(spawner: Spawner) -> ! {
                     } else {
                         let now = rtc.current_time_us();
                         if measurement_cnt == 3 && now - last_publish > 5_000_000 {
-                            info!("Publishing...");
-                            let date_time = jiff::Timestamp::from_microsecond(now as i64)
-                                .unwrap()
-                                .strftime("%Y-%m-%d %H:%M:%S UTC");
-                            let topic = format!("sensors/{}", parsed.model());
-                            let data = format!(
-                                "{{\"time\" : \"{}\", \"model\" : \"{}\", \"id\" : {}, \"channel\" : {}, \"battery_ok\" : {}, \"temperature_C\" : {}{}.{}, \"humidity\" : {} }}",
-                                date_time,
-                                parsed.model(),
-                                parsed.id,
-                                parsed.channel,
-                                parsed.battery_ok,
-                                { if parsed.sign < 0 { "-" } else { "" } },
-                                parsed.temp_int,
-                                parsed.temp_decimal,
-                                parsed.humidity
-                            );
-                            match mqtt.publish(topic.as_str(), data.as_str()).await {
-                                Ok(_) => {
-                                    last_publish = now;
-                                    info!(
-                                        "Published at {}",
-                                        jiff::Timestamp::from_microsecond(now as i64).unwrap()
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!("Failed to publish MQTT message: {:?}", e);
-                                }
-                            };
+                            info!("Passing data to MQTT sender...");
+                            MQTT_CHANNEL.send((parsed, now as i64)).await;
+                            last_publish = now;
                         } else if measurement_cnt < 3 {
                             measurement_cnt += 1;
                         }
