@@ -67,10 +67,10 @@ async fn mqtt_publisher(mqtt: &'static mut Mqtt, now: i64) {
     loop {
         let (data, timestamp) = MQTT_CHANNEL.receive().await;
 
-        if timestamp - last_publish > 360_000_000 {
+        if timestamp - last_publish > 300_000_000 {
             // Last successful publish was over 5 minutes ago, so something is wrong.
             // Panic and trigger watchdog reload to recover
-            panic!("No successful publishes in 360 seconds!");
+            panic!("No successful publishes in 300 seconds!");
         }
 
         info!("Publishing...");
