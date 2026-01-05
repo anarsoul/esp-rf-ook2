@@ -105,6 +105,7 @@ impl From<NexusTHPayload> for SensorData {
             humidity = 100;
         }
 
+        let channel: u8 = pld.channel.into();
         SensorData::new(
             "Nexus-TH",
             sign,
@@ -112,7 +113,7 @@ impl From<NexusTHPayload> for SensorData {
             temp_decimal,
             humidity,
             pld.battery_ok,
-            pld.channel.into(),
+            channel + 1,
             pld.id.into(),
         )
     }
