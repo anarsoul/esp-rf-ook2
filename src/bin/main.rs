@@ -61,6 +61,12 @@ static SHARED_STACK: StaticCell<Mutex<NoopRawMutex, Stack<'static>>> = StaticCel
 
 static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, (SensorData, i64), 2> = Channel::new();
 
+fn get_timestamp() -> u64 {
+    esp_hal::time::Instant::now()
+        .duration_since_epoch()
+        .as_millis()
+}
+
 #[embassy_executor::task]
 async fn mqtt_publisher(mqtt: &'static mut Mqtt, now: i64) {
     let mut last_publish: i64 = now;
@@ -79,7 +85,7 @@ async fn mqtt_publisher(mqtt: &'static mut Mqtt, now: i64) {
             .strftime("%Y-%m-%d %H:%M:%S UTC");
         let topic = format!("sensors/{}", data.model());
         let data = format!(
-            "{{\"time\" : \"{}\", \"model\" : \"{}\", \"id\" : {}, \"channel\" : {}, \"battery_ok\" : {}, \"temperature_C\" : {}{}.{}, \"humidity\" : {} }}",
+            "{{\"time\" : \"{}\", \"model\" : \"{}\", \"id\" : {}, \"channel\" : {}, \"battery_ok\" : {}, \"temperature_C\" : {}{}.{}, \"humidity\" : {}, \"uptime\" : {} }}",
             date_time,
             data.model(),
             data.id,
@@ -88,7 +94,8 @@ async fn mqtt_publisher(mqtt: &'static mut Mqtt, now: i64) {
             { if data.sign < 0 { "-" } else { "" } },
             data.temp_int,
             data.temp_decimal,
-            data.humidity
+            data.humidity,
+            get_timestamp(),
         );
         match mqtt.publish(topic.as_str(), data.as_str()).await {
             Ok(_) => {
