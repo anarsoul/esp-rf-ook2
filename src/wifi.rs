@@ -8,6 +8,8 @@ use esp_radio::{
 
 use embassy_executor::Spawner;
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use heapless::String;
 use log::{info, warn};
@@ -16,6 +18,7 @@ use static_cell::StaticCell;
 use crate::{PASSWORD, SSID};
 
 static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+static LINK_STATE: Signal<CriticalSectionRawMutex, bool> = Signal::new();
 
 pub struct Wifi {
     pub stack: Stack<'static>,
@@ -31,9 +34,9 @@ impl Wifi {
         rng: Rng,
         spawner: Spawner,
     ) -> Result<Self, Error> {
-        let (wifi_controller, interfaces) =
-            esp_radio::wifi::new(radio_init, wifi, Default::default())
-                .expect("Failed to initialize Wi-Fi controller");
+        let config = esp_radio::wifi::Config::default().with_rx_queue_size(10);
+        let (wifi_controller, interfaces) = esp_radio::wifi::new(radio_init, wifi, config)
+            .expect("Failed to initialize Wi-Fi controller");
 
         let wifi_interface = interfaces.sta;
 
@@ -46,10 +49,18 @@ impl Wifi {
 
         let resources = RESOURCES.init(StackResources::new());
 
-        // Init network stack
-        let (stack, runner) = embassy_net::new(wifi_interface, config, resources, seed);
-
         spawner.spawn(connection(wifi_controller)).ok();
+        info!("Waiting for link to come up...");
+        loop {
+            let link_is_up = LINK_STATE.wait().await;
+            Timer::after(Duration::from_millis(500)).await;
+            if link_is_up {
+                break;
+            }
+        }
+        info!("Link is up, starting stack");
+
+        let (stack, runner) = embassy_net::new(wifi_interface, config, resources, seed);
         spawner.spawn(net_task(runner)).ok();
 
         Ok(Self { stack })
@@ -70,7 +81,8 @@ impl Wifi {
                 info!("Got IP: {}", config.address);
                 break;
             }
-            Timer::after(Duration::from_millis(500)).await;
+            info!("Waiting...");
+            Timer::after(Duration::from_millis(1000)).await;
         }
         Ok(())
     }
@@ -78,7 +90,7 @@ impl Wifi {
 
 #[embassy_executor::task]
 async fn connection(mut controller: WifiController<'static>) {
-    info!("start connection task");
+    info!("Start connection task");
     info!("Device capabilities: {:?}", controller.capabilities());
     loop {
         if esp_radio::wifi::sta_state() == WifiStaState::Connected {
@@ -110,9 +122,13 @@ async fn connection(mut controller: WifiController<'static>) {
         info!("About to connect...");
 
         match controller.connect_async().await {
-            Ok(_) => info!("Wifi connected!"),
+            Ok(_) => {
+                info!("Wifi connected!");
+                LINK_STATE.signal(true);
+            }
             Err(e) => {
                 warn!("Failed to connect to wifi: {:?}", e);
+                LINK_STATE.signal(false);
                 Timer::after(Duration::from_millis(5000)).await
             }
         }
