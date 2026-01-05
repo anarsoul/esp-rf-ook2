@@ -139,8 +139,8 @@ async fn main(spawner: Spawner) -> ! {
 
     loop {
         wdt.feed();
-        // Re-sync time every 10_000 seconds (~2.7 hours)
-        if rtc.current_time_us() - last_time > 10_000_000_000 {
+        // Re-sync time every 3_600 seconds (1 hour)
+        if rtc.current_time_us() - last_time > 3_600_000_000 {
             info!("Re-syncing time via NTP...");
             let time = ntpc.get_time().await.expect("Failed to get NTP time");
             rtc.set_current_time_us(time * 1_000_000);
