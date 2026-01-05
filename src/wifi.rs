@@ -36,7 +36,7 @@ impl Wifi {
     ) -> Result<Self, Error> {
         let config = esp_radio::wifi::Config::default().with_rx_queue_size(10);
         let (wifi_controller, interfaces) = esp_radio::wifi::new(radio_init, wifi, config)
-            .expect("Failed to initialize Wi-Fi controller");
+            .expect("Failed to initialize WiFi controller");
 
         let wifi_interface = interfaces.sta;
 
@@ -105,9 +105,9 @@ async fn connection(mut controller: WifiController<'static>) {
                     .with_password(PASSWORD.into()),
             );
             controller.set_config(&client_config).unwrap();
-            info!("Starting wifi");
+            info!("Starting WiFi");
             controller.start_async().await.unwrap();
-            info!("Wifi started!");
+            info!("WiFi started!");
 
             info!("Scan");
             let scan_config = ScanConfig::default().with_max(10);
@@ -123,11 +123,11 @@ async fn connection(mut controller: WifiController<'static>) {
 
         match controller.connect_async().await {
             Ok(_) => {
-                info!("Wifi connected!");
+                info!("WiFi connected!");
                 LINK_STATE.signal(true);
             }
             Err(e) => {
-                warn!("Failed to connect to wifi: {:?}", e);
+                warn!("Failed to connect to WiFi: {:?}", e);
                 LINK_STATE.signal(false);
                 Timer::after(Duration::from_millis(5000)).await
             }
