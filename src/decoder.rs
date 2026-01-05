@@ -1,4 +1,5 @@
 use esp_hal::gpio::Level;
+use esp_hal::ram;
 use esp_hal::rmt::PulseCode;
 use packed_struct::prelude::*;
 
@@ -43,6 +44,7 @@ impl Default for SensorData {
 }
 
 impl SensorData {
+    #[ram]
     #[allow(clippy::too_many_arguments)]
     fn new(
         model: &str,
@@ -69,6 +71,7 @@ impl SensorData {
             id,
         }
     }
+    #[ram]
     pub fn model(&self) -> &str {
         let len = self
             .model
@@ -79,6 +82,7 @@ impl SensorData {
         str::from_utf8(&self.model[..len]).unwrap_or("")
     }
 
+    #[ram]
     pub fn equal(&self, a: &SensorData) -> bool {
         self.sign == a.sign
             && self.temp_int == a.temp_int
@@ -88,6 +92,7 @@ impl SensorData {
 }
 
 impl From<NexusTHPayload> for SensorData {
+    #[ram]
     fn from(pld: NexusTHPayload) -> Self {
         let mut sign = 1;
         let mut temp_10x: u16 = pld.temp_10x.into();
@@ -138,6 +143,7 @@ struct NexusTHPayload {
     humidity: Integer<u8, packed_bits::Bits<8>>,
 }
 
+#[ram]
 pub fn decode(pulses: &[PulseCode], ch: u8, len: usize) -> Result<SensorData, DecodeError> {
     // len should be number of bits + terminator
     if len != PAYLOAD_LEN_BITS + 1 {
