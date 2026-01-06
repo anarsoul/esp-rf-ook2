@@ -1,4 +1,4 @@
-use embassy_net::{Stack, dns::DnsQueryType, tcp::TcpSocket};
+use embassy_net::{IpAddress, Stack, dns::DnsQueryType, tcp::TcpSocket};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Timer};
 
@@ -18,12 +18,14 @@ pub enum Error {
     ConnectionFailed,
     PublishFailed,
     DisconnectFailed,
+    FlushError,
 }
 
 pub struct Mqtt {
     stack: &'static Mutex<NoopRawMutex, Stack<'static>>,
     rx_buf: &'static Mutex<NoopRawMutex, [u8; RX_BUFFER_SIZE]>,
     tx_buf: &'static Mutex<NoopRawMutex, [u8; TX_BUFFER_SIZE]>,
+    addr: Option<IpAddress>,
 }
 
 impl Mqtt {
@@ -36,6 +38,7 @@ impl Mqtt {
             stack,
             rx_buf,
             tx_buf,
+            addr: None,
         }
     }
 
@@ -44,20 +47,27 @@ impl Mqtt {
         let mut tx_buf = self.tx_buf.lock().await;
         let mut rx_buf = self.rx_buf.lock().await;
 
-        let addr = stack
-            .dns_query(MQTT_SERVER, DnsQueryType::A)
-            .await
-            .map_err(|_| Error::DnsResolveFailed)?
-            .first()
-            .copied()
-            .ok_or(Error::DnsResolveFailed)?;
+        // Cache address after first resolution
+        if self.addr.is_none() {
+            let addr = stack
+                .dns_query(MQTT_SERVER, DnsQueryType::A)
+                .await
+                .map_err(|_| Error::DnsResolveFailed)?
+                .first()
+                .copied()
+                .ok_or(Error::DnsResolveFailed)?;
+            self.addr = Some(addr);
+        }
+
+        let addr = self.addr.unwrap();
 
         let mut socket = TcpSocket::new(*stack, &mut *rx_buf, &mut *tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
-        socket
-            .connect((addr, 1883))
-            .await
-            .map_err(|_| Error::ConnectionFailed)?;
+        socket.connect((addr, 1883)).await.map_err(|e| {
+            self.addr = None; // Clear cached address on failure
+            warn!("Error: {:?}", e);
+            Error::ConnectionFailed
+        })?;
 
         let mut config = MqttClientConfig::new(
             rust_mqtt::client::client_config::MqttVersion::MQTTv5,
@@ -87,6 +97,7 @@ impl Mqtt {
         };
 
         client.connect_to_broker().await.map_err(|e| {
+            self.addr = None; // Clear cached address on failure
             warn!("Error: {:?}", e);
             Error::ConnectionFailed
         })?;
@@ -97,6 +108,7 @@ impl Mqtt {
             .send_message(topic, data.as_bytes(), QoS0, false)
             .await
             .map_err(|e| {
+                self.addr = None; // Clear cached address on failure
                 warn!("Error: {:?}", e);
                 Error::PublishFailed
             })?;
@@ -104,13 +116,21 @@ impl Mqtt {
         debug!("Published to topic {}", topic);
 
         client.disconnect().await.map_err(|e| {
+            self.addr = None; // Clear cached address on failure
             warn!("Error: {:?}", e);
             Error::DisconnectFailed
         })?;
 
+        socket.flush().await.map_err(|e| {
+            self.addr = None; // Clear cached address on failure
+            warn!("Failed to flush socket: {:?}", e);
+            Error::FlushError
+        })?;
+        Timer::after(Duration::from_millis(100)).await;
         socket.close();
         // Give stack some time to process the socket closure
         Timer::after(Duration::from_millis(100)).await;
+        socket.abort();
 
         Ok(())
     }

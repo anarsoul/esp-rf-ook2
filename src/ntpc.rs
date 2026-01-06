@@ -1,6 +1,6 @@
-use core::net::{IpAddr, SocketAddr};
+use core::net::SocketAddr;
 use embassy_net::{
-    Stack,
+    IpAddress, Stack,
     dns::DnsQueryType,
     udp::{PacketMetadata, UdpSocket},
 };
@@ -9,11 +9,11 @@ use embassy_time::{Duration, Timer};
 
 use crate::{NTP_SERVER, RX_BUFFER_SIZE, TX_BUFFER_SIZE};
 
-use sntpc::{Error, NtpContext, NtpTimestampGenerator, get_time};
+use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
 
 use embassy_futures::select::{Either, select};
 
-use log::info;
+use log::warn;
 
 #[derive(Clone, Copy)]
 struct Timestamp {
@@ -38,6 +38,15 @@ pub struct Ntpc {
     stack: &'static Mutex<NoopRawMutex, Stack<'static>>,
     rx_buf: &'static Mutex<NoopRawMutex, [u8; RX_BUFFER_SIZE]>,
     tx_buf: &'static Mutex<NoopRawMutex, [u8; TX_BUFFER_SIZE]>,
+    addr: Option<IpAddress>,
+}
+
+#[derive(Debug)]
+pub enum NtpcError {
+    DnsResolveFailed,
+    SocketBindFailed,
+    NetworkError,
+    Timeout,
 }
 
 impl Ntpc {
@@ -50,10 +59,11 @@ impl Ntpc {
             stack,
             rx_buf,
             tx_buf,
+            addr: None,
         }
     }
 
-    pub async fn get_time(&mut self) -> Option<u64> {
+    pub async fn get_time(&mut self) -> Result<u64, NtpcError> {
         let stack = self.stack.lock().await;
         let mut tx_buf = self.tx_buf.lock().await;
         let mut rx_buf = self.rx_buf.lock().await;
@@ -61,11 +71,19 @@ impl Ntpc {
         let mut rx_meta = [PacketMetadata::EMPTY; 16];
         let mut tx_meta = [PacketMetadata::EMPTY; 16];
 
-        let ntp_addrs = stack.dns_query(NTP_SERVER, DnsQueryType::A).await.unwrap();
-
-        if ntp_addrs.is_empty() {
-            panic!("Failed to resolve NTP server address");
+        // Cache address after first resolution
+        if self.addr.is_none() {
+            let addr = stack
+                .dns_query(NTP_SERVER, DnsQueryType::A)
+                .await
+                .map_err(|_| NtpcError::DnsResolveFailed)?
+                .first()
+                .copied()
+                .ok_or(NtpcError::DnsResolveFailed)?;
+            self.addr = Some(addr);
         }
+
+        let addr = self.addr.unwrap();
 
         let mut socket = UdpSocket::new(
             *stack,
@@ -75,9 +93,11 @@ impl Ntpc {
             &mut *tx_buf,
         );
 
-        socket.bind(123).unwrap();
-
-        let addr: IpAddr = ntp_addrs[0].into();
+        socket.bind(123).map_err(|e| {
+            self.addr = None; // Clear cached address on failure
+            warn!("Failed to bind NTP socket: {:?}", e);
+            NtpcError::SocketBindFailed
+        })?;
 
         let a = get_time(
             SocketAddr::from((addr, 123)),
@@ -89,25 +109,22 @@ impl Ntpc {
         let result = select(a, b).await;
 
         let result = match result {
-            Either::First(res) => res,
-            Either::Second(_) => Err(Error::Network),
+            Either::First(res) => {
+                res.map(|r| r.sec() as u64).map_err(|e| {
+                    self.addr = None; // Clear cached address on failure
+                    warn!("NTP get_time error: {:?}", e);
+                    NtpcError::Timeout
+                })
+            }
+            Either::Second(_) => Err(NtpcError::Timeout),
         };
 
-        let res = match result {
-            Ok(time) => {
-                info!("NTP time: {}", time.sec());
-                Some(time.sec() as u64)
-            }
-            Err(e) => {
-                info!("Failed to get NTP time: {:?}", e);
-                None
-            }
-        };
-
+        socket.flush().await;
+        Timer::after(Duration::from_millis(100)).await;
         socket.close();
         // Give stack some time to process the socket closure
         Timer::after(Duration::from_millis(100)).await;
 
-        res
+        result
     }
 }
