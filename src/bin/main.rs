@@ -30,7 +30,6 @@ use esp_rf_ook2::decoder::{DecodeError, SensorData, decode};
 use esp_rf_ook2::mqtt::Mqtt;
 use esp_rf_ook2::ntpc::Ntpc;
 use esp_rf_ook2::wifi::Wifi;
-use esp_rf_ook2::{RX_BUFFER_SIZE, TX_BUFFER_SIZE};
 
 use embassy_futures::select::{Either, select};
 use embassy_net::Stack;
@@ -55,8 +54,6 @@ macro_rules! mk_static {
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
-static RX_BUF: StaticCell<Mutex<NoopRawMutex, [u8; RX_BUFFER_SIZE]>> = StaticCell::new();
-static TX_BUF: StaticCell<Mutex<NoopRawMutex, [u8; TX_BUFFER_SIZE]>> = StaticCell::new();
 static SHARED_STACK: StaticCell<Mutex<NoopRawMutex, Stack<'static>>> = StaticCell::new();
 
 static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, (SensorData, i64), 2> = Channel::new();
@@ -144,10 +141,6 @@ async fn main(spawner: Spawner) -> ! {
     wdt.feed();
 
     let shared_stack = SHARED_STACK.init(Mutex::new(wifi.stack));
-    // Sockets cannot share the buffers, so users have to make sure that the socket is
-    // closed before releasing the mutex.
-    let rx_buf = RX_BUF.init(Mutex::new([0; RX_BUFFER_SIZE]));
-    let tx_buf = TX_BUF.init(Mutex::new([0; TX_BUFFER_SIZE]));
 
     wdt.feed();
     let a = wifi.wait_for_ip();
@@ -164,7 +157,7 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     wdt.feed();
-    let mut ntpc = Ntpc::new(shared_stack, rx_buf, tx_buf);
+    let mut ntpc = Ntpc::new(shared_stack);
 
     let time = ntpc.get_time().await.expect("Failed to get NTP time");
     rtc.set_current_time_us(time * 1_000_000);
@@ -188,7 +181,7 @@ async fn main(spawner: Spawner) -> ! {
         .expect("Failed to configure RMT RX channel");
     let mut data: [PulseCode; 64] = [PulseCode::default(); 64];
 
-    let mqtt = &mut *mk_static!(Mqtt, Mqtt::new(shared_stack, rx_buf, tx_buf));
+    let mqtt = &mut *mk_static!(Mqtt, Mqtt::new(shared_stack));
     spawner
         .spawn(mqtt_publisher(mqtt, rtc.current_time_us() as i64))
         .expect("Failed to spawn MQTT sender task");

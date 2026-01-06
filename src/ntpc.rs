@@ -36,8 +36,6 @@ impl NtpTimestampGenerator for Timestamp {
 
 pub struct Ntpc {
     stack: &'static Mutex<NoopRawMutex, Stack<'static>>,
-    rx_buf: &'static Mutex<NoopRawMutex, [u8; RX_BUFFER_SIZE]>,
-    tx_buf: &'static Mutex<NoopRawMutex, [u8; TX_BUFFER_SIZE]>,
     addr: Option<IpAddress>,
 }
 
@@ -50,23 +48,14 @@ pub enum NtpcError {
 }
 
 impl Ntpc {
-    pub fn new(
-        stack: &'static Mutex<NoopRawMutex, Stack<'static>>,
-        rx_buf: &'static Mutex<NoopRawMutex, [u8; RX_BUFFER_SIZE]>,
-        tx_buf: &'static Mutex<NoopRawMutex, [u8; TX_BUFFER_SIZE]>,
-    ) -> Self {
-        Ntpc {
-            stack,
-            rx_buf,
-            tx_buf,
-            addr: None,
-        }
+    pub fn new(stack: &'static Mutex<NoopRawMutex, Stack<'static>>) -> Self {
+        Ntpc { stack, addr: None }
     }
 
     pub async fn get_time(&mut self) -> Result<u64, NtpcError> {
         let stack = self.stack.lock().await;
-        let mut tx_buf = self.tx_buf.lock().await;
-        let mut rx_buf = self.rx_buf.lock().await;
+        let mut tx_buf: [u8; TX_BUFFER_SIZE] = [0; TX_BUFFER_SIZE];
+        let mut rx_buf: [u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE];
 
         let mut rx_meta = [PacketMetadata::EMPTY; 16];
         let mut tx_meta = [PacketMetadata::EMPTY; 16];
@@ -85,13 +74,8 @@ impl Ntpc {
 
         let addr = self.addr.unwrap();
 
-        let mut socket = UdpSocket::new(
-            *stack,
-            &mut rx_meta,
-            &mut *rx_buf,
-            &mut tx_meta,
-            &mut *tx_buf,
-        );
+        let mut socket =
+            UdpSocket::new(*stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
 
         socket.bind(123).map_err(|e| {
             self.addr = None; // Clear cached address on failure

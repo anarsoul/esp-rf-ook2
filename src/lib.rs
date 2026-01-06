@@ -7,8 +7,8 @@ pub mod wifi;
 
 extern crate alloc;
 
-pub const RX_BUFFER_SIZE: usize = 4096;
-pub const TX_BUFFER_SIZE: usize = 4096;
+pub const RX_BUFFER_SIZE: usize = 2048;
+pub const TX_BUFFER_SIZE: usize = 2048;
 
 pub const SSID: &str = env!("SSID");
 pub const PASSWORD: &str = env!("PASSWORD");

@@ -23,29 +23,18 @@ pub enum Error {
 
 pub struct Mqtt {
     stack: &'static Mutex<NoopRawMutex, Stack<'static>>,
-    rx_buf: &'static Mutex<NoopRawMutex, [u8; RX_BUFFER_SIZE]>,
-    tx_buf: &'static Mutex<NoopRawMutex, [u8; TX_BUFFER_SIZE]>,
     addr: Option<IpAddress>,
 }
 
 impl Mqtt {
-    pub fn new(
-        stack: &'static Mutex<NoopRawMutex, Stack<'static>>,
-        rx_buf: &'static Mutex<NoopRawMutex, [u8; RX_BUFFER_SIZE]>,
-        tx_buf: &'static Mutex<NoopRawMutex, [u8; TX_BUFFER_SIZE]>,
-    ) -> Self {
-        Mqtt {
-            stack,
-            rx_buf,
-            tx_buf,
-            addr: None,
-        }
+    pub fn new(stack: &'static Mutex<NoopRawMutex, Stack<'static>>) -> Self {
+        Mqtt { stack, addr: None }
     }
 
     pub async fn publish(&mut self, topic: &str, data: &str) -> Result<(), Error> {
         let stack = self.stack.lock().await;
-        let mut tx_buf = self.tx_buf.lock().await;
-        let mut rx_buf = self.rx_buf.lock().await;
+        let mut tx_buf: [u8; TX_BUFFER_SIZE] = [0; TX_BUFFER_SIZE];
+        let mut rx_buf: [u8; RX_BUFFER_SIZE] = [0; RX_BUFFER_SIZE];
 
         // Cache address after first resolution
         if self.addr.is_none() {
@@ -61,7 +50,7 @@ impl Mqtt {
 
         let addr = self.addr.unwrap();
 
-        let mut socket = TcpSocket::new(*stack, &mut *rx_buf, &mut *tx_buf);
+        let mut socket = TcpSocket::new(*stack, &mut rx_buf, &mut tx_buf);
         socket.set_timeout(Some(Duration::from_secs(10)));
         socket.connect((addr, 1883)).await.map_err(|e| {
             self.addr = None; // Clear cached address on failure
