@@ -41,7 +41,10 @@ impl Mqtt {
             let addr = stack
                 .dns_query(MQTT_SERVER, DnsQueryType::A)
                 .await
-                .map_err(|_| Error::DnsResolveFailed)?
+                .map_err(|e| {
+                    warn!("DNS resolve failed: {:?}", e);
+                    Error::DnsResolveFailed
+                })?
                 .first()
                 .copied()
                 .ok_or(Error::DnsResolveFailed)?;
