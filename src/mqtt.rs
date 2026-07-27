@@ -61,6 +61,23 @@ impl Mqtt {
             Error::ConnectionFailed
         })?;
 
+        let res = self.publish_inner(&mut socket, topic, data).await;
+
+        if let Err(e) = socket.flush().await {
+            self.addr = None; // Clear cached address on failure
+            warn!("Failed to flush socket: {:?}", e);
+        };
+
+        Timer::after(Duration::from_millis(100)).await;
+        socket.close();
+        // Give stack some time to process the socket closure
+        Timer::after(Duration::from_millis(100)).await;
+        socket.abort();
+
+        res
+    }
+
+    async fn publish_inner<'a>(&mut self, socket: &mut TcpSocket<'a>, topic: &str, data: &str) -> Result<(), Error> {
         let mut config = MqttClientConfig::new(
             rust_mqtt::client::client_config::MqttVersion::MQTTv5,
             CountingRng(20000),
@@ -79,7 +96,7 @@ impl Mqtt {
             let writebuf_len = writebuf.len();
             let readbuf_len = readbuf.len();
             MqttClient::<_, 5, _>::new(
-                &mut socket,
+                socket,
                 &mut writebuf,
                 writebuf_len,
                 &mut readbuf,
@@ -113,17 +130,7 @@ impl Mqtt {
             Error::DisconnectFailed
         })?;
 
-        socket.flush().await.map_err(|e| {
-            self.addr = None; // Clear cached address on failure
-            warn!("Failed to flush socket: {:?}", e);
-            Error::FlushError
-        })?;
-        Timer::after(Duration::from_millis(100)).await;
-        socket.close();
-        // Give stack some time to process the socket closure
-        Timer::after(Duration::from_millis(100)).await;
-        socket.abort();
-
         Ok(())
+
     }
 }
