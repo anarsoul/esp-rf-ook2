@@ -77,7 +77,12 @@ impl Mqtt {
         res
     }
 
-    async fn publish_inner<'a>(&mut self, socket: &mut TcpSocket<'a>, topic: &str, data: &str) -> Result<(), Error> {
+    async fn publish_inner<'a>(
+        &mut self,
+        socket: &mut TcpSocket<'a>,
+        topic: &str,
+        data: &str,
+    ) -> Result<(), Error> {
         let mut config = MqttClientConfig::new(
             rust_mqtt::client::client_config::MqttVersion::MQTTv5,
             CountingRng(20000),
@@ -131,6 +136,5 @@ impl Mqtt {
         })?;
 
         Ok(())
-
     }
 }
