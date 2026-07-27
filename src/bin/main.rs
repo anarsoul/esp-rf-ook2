@@ -26,6 +26,7 @@ use embassy_sync::{
 };
 use log::{info, warn};
 
+use esp_rf_ook2::MQTT_TOPIC;
 use esp_rf_ook2::decoder::{DecodeError, SensorData, decode};
 use esp_rf_ook2::mqtt::Mqtt;
 use esp_rf_ook2::ntpc::Ntpc;
@@ -80,7 +81,7 @@ async fn mqtt_publisher(mqtt: &'static mut Mqtt, now: i64) {
         let date_time = jiff::Timestamp::from_microsecond(timestamp)
             .unwrap()
             .strftime("%Y-%m-%d %H:%M:%S UTC");
-        let topic = format!("sensors/{}", data.model());
+        let topic = format!("{}/{}", MQTT_TOPIC, data.model());
         let data = format!(
             "{{\"time\" : \"{}\", \"model\" : \"{}\", \"id\" : {}, \"channel\" : {}, \"battery_ok\" : {}, \"temperature_C\" : {}{}.{}, \"humidity\" : {}, \"uptime\" : {} }}",
             date_time,
