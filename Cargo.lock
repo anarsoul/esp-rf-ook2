@@ -198,6 +198,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "decoder"
+version = "0.1.0"
+dependencies = [
+ "esp-hal",
+ "packed_struct",
+]
+
+[[package]]
 name = "delegate"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -718,6 +726,7 @@ name = "esp-rf-ook2"
 version = "0.1.0"
 dependencies = [
  "critical-section",
+ "decoder",
  "embassy-executor",
  "embassy-futures",
  "embassy-net",
@@ -733,7 +742,6 @@ dependencies = [
  "heapless 0.8.0",
  "jiff",
  "log",
- "packed_struct",
  "rust-mqtt",
  "smoltcp",
  "sntpc",

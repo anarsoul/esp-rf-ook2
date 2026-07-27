@@ -61,8 +61,10 @@ log = "0.4.29"
 embassy-sync = { version = "0.7.2", features = ["log"] }
 embassy-futures = { version = "0.1.2", features = ["log"] }
 rust-mqtt = { version = "0.3.1", default-features = false }
-packed_struct = { version = "0.10.1", default-features = false }
+decoder = { path = "decoder" }
 
+[workspace]
+members = ["decoder"]
 
 [profile.dev]
 # Rust debug is too slow.

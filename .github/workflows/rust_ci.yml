@@ -47,3 +47,21 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Run command
         run: cargo ${{ matrix.action.command }} ${{ matrix.action.args }}
+
+  decoder-tests:
+    name: Decoder unit tests (host)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      # The decoder crate is plain stable Rust with no hardware or nightly
+      # dependency, so it's tested on stable rather than the esp toolchain.
+      # That's also what makes it work: the stable toolchain ignores the
+      # nightly-only `[unstable] build-std` in .cargo/config.toml, so the
+      # host target links against its own prebuilt std.
+      - name: Setup stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Enable caching
+        uses: Swatinem/rust-cache@v2
+      - name: Run decoder tests on host
+        run: cargo +stable test-decoder

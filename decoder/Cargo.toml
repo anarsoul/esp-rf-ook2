@@ -1,0 +1,14 @@
+[package]
+edition      = "2024"
+name         = "decoder"
+rust-version = "1.88"
+version      = "0.1.0"
+
+[dependencies]
+packed_struct = { version = "0.10.1", default-features = false }
+
+# Only needed on-device, to place hot functions in IRAM via `#[ram]`. Kept
+# out of the dependency graph entirely on other targets so this crate stays
+# host-testable with a plain `cargo test`.
+[target.'cfg(target_arch = "xtensa")'.dependencies]
+esp-hal = { version = "1.0.0", default-features = false, features = ["esp32"] }

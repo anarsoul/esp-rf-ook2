@@ -1,6 +1,6 @@
 #![no_std]
 
-pub mod decoder;
+pub use decoder;
 pub mod mqtt;
 pub mod ntpc;
 pub mod wifi;

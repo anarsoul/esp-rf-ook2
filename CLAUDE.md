@@ -12,7 +12,11 @@ on GPIO21, and publishes readings to MQTT over WiFi. It's a rewrite of
 
 The Nexus-TH protocol details (pulse timings, 36-bit payload layout) are
 documented in README.md and mirrored in the constants/comments in
-`src/decoder.rs`.
+`decoder/src/lib.rs`.
+
+This is a two-member Cargo workspace: the root package (`esp-rf-ook2`,
+`no_std`, xtensa-only) and `decoder/` (the pure protocol-decode logic,
+`no_std` on-device but plain-testable on the host — see "Testing" below).
 
 ## Build environment
 
@@ -40,9 +44,36 @@ cargo clippy --all-features --workspace -- -D warnings
 cargo run --release          # builds, flashes over USB via espflash, and opens serial monitor (see .cargo/config.toml runner)
 ```
 
-There is no test suite — this crate is `no_std`/embedded and has no
-`#[test]` targets; correctness is checked via `build`, `fmt`, and `clippy`
-in CI, matching the three CI matrix jobs.
+The root crate has no test suite — it's `no_std`/embedded with no `#[test]`
+targets; correctness there is checked via `build`, `fmt`, and `clippy` in
+CI, matching the three CI matrix jobs.
+
+`decoder/` does have host-runnable unit tests (`decoder/src/lib.rs`,
+`#[cfg(test)] mod tests`), since it has no hardware dependency:
+
+```sh
+cargo +stable test-decoder   # alias in .cargo/config.toml
+```
+
+The `+stable` is load-bearing, not incidental. `.cargo/config.toml` sets
+`[unstable] build-std`, which is required for the xtensa target (the esp
+toolchain ships no prebuilt `core`/`alloc` for `xtensa-esp32-none-elf`)
+but breaks any host-target build: it recompiles `core` from source, which
+then collides with the prebuilt `std` the test harness links against
+("duplicate lang item: sized"). `build-std` can't be scoped to one target
+and can't be un-set by a nested config — Cargo *joins* array-valued config
+keys across files rather than letting the deeper one replace them. The
+stable toolchain sidesteps all of it by ignoring `[unstable]` keys
+outright, and since the decoder crate is plain stable Rust, testing it
+there is honest rather than a workaround.
+
+Relatedly, keep linker `rustflags` under `[target.xtensa-esp32-none-elf]`
+and *not* `[build]` — `[build] rustflags` applies to every target, so
+`-nostartfiles` would leak into host test binaries and produce an
+executable with no entry point that segfaults before `main`.
+
+CI runs the tests as a separate `decoder-tests` job (on stable) in
+`.github/workflows/rust_ci.yml`.
 
 `ESP_LOG` is set to `info` by default via `.cargo/config.toml`.
 
@@ -54,11 +85,17 @@ watchdog → loop reading RMT pulse trains and decoding/publishing sensor
 data. Library code lives in `src/lib.rs` and is split into independent
 modules, each owning one concern:
 
-- **`decoder.rs`** — pure, no-I/O signal decoding. Converts raw RMT
-  `PulseCode` pulse-width samples into a `SensorData` via a `packed_struct`
-  bitfield (`NexusTHPayload`), with range/channel/checksum-style validation
-  returning a `DecodeError`. Safe to reason about and modify without
-  touching networking code.
+- **`decoder` crate** (`decoder/src/lib.rs`) — pure, no-I/O signal
+  decoding, and the one part of this codebase with unit tests. Converts a
+  `Pulse`/`PulseLevel` pulse-width sample train into a `SensorData` via a
+  `packed_struct` bitfield (`NexusTHPayload`), with range/channel/checksum-
+  style validation returning a `DecodeError`. `Pulse`/`PulseLevel` are
+  local stand-ins for `esp_hal::rmt::PulseCode`/`esp_hal::gpio::Level` —
+  this crate has no `esp_hal` dependency on the host target (only
+  target-gated for `xtensa`, to keep the `#[ram]` placement of hot
+  functions on-device); `main.rs` converts `PulseCode` → `Pulse` at the
+  RMT call site (`to_pulse`/`to_pulse_level`). Safe to reason about and
+  modify without touching networking code.
 - **`wifi.rs`** — owns the `esp_radio` WiFi controller and the
   `embassy-net` `Stack`. Runs its own reconnect loop as a spawned embassy
   task (`connection`) driven by a `Signal`, plus a `net_task` running the

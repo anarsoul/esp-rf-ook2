@@ -1,14 +1,23 @@
 [target.xtensa-esp32-none-elf]
 runner = "espflash flash --baud 921600 --monitor --chip esp32"
-
-[env]
-ESP_LOG="info"
-
-[build]
+# Scoped to the target rather than [build] so it doesn't leak into host
+# builds -- `-nostartfiles` on the host produces a test binary with no
+# entry point, which segfaults before main.
 rustflags = [
   "-C", "link-arg=-nostartfiles",
 ]
 
+[env]
+ESP_LOG="info"
+
+# Run the decoder crate's unit tests on the host. Must be invoked as
+# `cargo +stable test-decoder`: the `[unstable]` build-std below is
+# nightly-only, and the stable toolchain ignores it, which is what lets
+# the host target link against its own prebuilt std.
+[alias]
+test-decoder = "test -p decoder --target x86_64-unknown-linux-gnu"
+
+[build]
 target = "xtensa-esp32-none-elf"
 
 [unstable]

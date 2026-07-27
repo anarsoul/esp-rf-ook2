@@ -27,7 +27,7 @@ use embassy_sync::{
 use log::{info, warn};
 
 use esp_rf_ook2::MQTT_TOPIC;
-use esp_rf_ook2::decoder::{DecodeError, SensorData, decode};
+use esp_rf_ook2::decoder::{DecodeError, Pulse, PulseLevel, SensorData, decode};
 use esp_rf_ook2::mqtt::Mqtt;
 use esp_rf_ook2::ntpc::Ntpc;
 use esp_rf_ook2::wifi::Wifi;
@@ -63,6 +63,22 @@ fn get_timestamp() -> u64 {
     esp_hal::time::Instant::now()
         .duration_since_epoch()
         .as_millis()
+}
+
+fn to_pulse_level(level: esp_hal::gpio::Level) -> PulseLevel {
+    match level {
+        esp_hal::gpio::Level::Low => PulseLevel::Low,
+        esp_hal::gpio::Level::High => PulseLevel::High,
+    }
+}
+
+fn to_pulse(pulse: PulseCode) -> Pulse {
+    Pulse {
+        level1: to_pulse_level(pulse.level1()),
+        length1: pulse.length1(),
+        level2: to_pulse_level(pulse.level2()),
+        length2: pulse.length2(),
+    }
 }
 
 #[embassy_executor::task]
@@ -223,35 +239,38 @@ async fn main(spawner: Spawner) -> ! {
             }
         };
         match res {
-            Ok(symbol_count) => match decode(&data, 1, symbol_count) {
-                Ok(parsed) => {
-                    info!(
-                        "Temperature: {}{}.{}C, Humidity: {}%",
-                        { if parsed.sign < 0 { "-" } else { "" } },
-                        parsed.temp_int,
-                        parsed.temp_decimal,
-                        parsed.humidity
-                    );
-                    if !measurement.equal(&parsed) {
-                        measurement = parsed;
-                        measurement_cnt = 1;
-                    } else {
-                        let now = rtc.current_time_us();
-                        if measurement_cnt == 3 && now - last_publish > 5_000_000 {
-                            MQTT_CHANNEL.send((parsed, now as i64)).await;
-                            last_publish = now;
-                        } else if measurement_cnt < 3 {
-                            measurement_cnt += 1;
+            Ok(symbol_count) => {
+                let pulses: [Pulse; 64] = core::array::from_fn(|i| to_pulse(data[i]));
+                match decode(&pulses, 1, symbol_count) {
+                    Ok(parsed) => {
+                        info!(
+                            "Temperature: {}{}.{}C, Humidity: {}%",
+                            { if parsed.sign < 0 { "-" } else { "" } },
+                            parsed.temp_int,
+                            parsed.temp_decimal,
+                            parsed.humidity
+                        );
+                        if !measurement.equal(&parsed) {
+                            measurement = parsed;
+                            measurement_cnt = 1;
+                        } else {
+                            let now = rtc.current_time_us();
+                            if measurement_cnt == 3 && now - last_publish > 5_000_000 {
+                                MQTT_CHANNEL.send((parsed, now as i64)).await;
+                                last_publish = now;
+                            } else if measurement_cnt < 3 {
+                                measurement_cnt += 1;
+                            }
                         }
                     }
+                    Err(e) => match e {
+                        DecodeError::WrongPayloadLen(_len) => {}
+                        _ => {
+                            warn!("Decode error: {:?}", e);
+                        }
+                    },
                 }
-                Err(e) => match e {
-                    DecodeError::WrongPayloadLen(_len) => {}
-                    _ => {
-                        warn!("Decode error: {:?}", e);
-                    }
-                },
-            },
+            }
             Err(_e) => {}
         }
     }
