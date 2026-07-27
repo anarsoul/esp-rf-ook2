@@ -21,6 +21,10 @@ toolchain (`channel = "esp"` in `rust-toolchain.toml`), not upstream
 stable/nightly. `.cargo/config.toml` sets the target, `build-std`, and the
 runner (`espflash flash --monitor`).
 
+Run `source ~/export-esp.sh` before any `cargo build`/`clippy`/`run` —
+it puts the xtensa-gcc toolchain on `PATH`, which the linker needs. Without
+it the build fails at the link step, not at compile time.
+
 Required env vars at build time (baked in via `env!()` in `src/lib.rs`, so
 missing ones are a hard build failure): `SSID`, `PASSWORD`, `MQTT_SERVER`,
 `MQTT_LOGIN`, `MQTT_PASSWORD`, `MQTT_TOPIC`. Locally these live in `.env`
