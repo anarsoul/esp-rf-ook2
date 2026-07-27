@@ -63,10 +63,15 @@ impl Mqtt {
 
         let res = self.publish_inner(&mut socket, topic, data).await;
 
-        if let Err(e) = socket.flush().await {
+        // We publish at QoS0, so nothing is acknowledged at the MQTT layer:
+        // the only evidence the message actually left the device is the
+        // socket draining. Treat a failed flush as a failed publish so the
+        // caller doesn't record a success that never made it to the broker.
+        let flushed = socket.flush().await.map_err(|e| {
             self.addr = None; // Clear cached address on failure
             warn!("Failed to flush socket: {:?}", e);
-        };
+            Error::FlushError
+        });
 
         Timer::after(Duration::from_millis(100)).await;
         socket.close();
@@ -74,7 +79,9 @@ impl Mqtt {
         Timer::after(Duration::from_millis(100)).await;
         socket.abort();
 
-        res
+        // Keep the original error if there was one -- a flush failure that
+        // follows it is a downstream symptom, not the root cause.
+        res.and(flushed)
     }
 
     async fn publish_inner<'a>(
