@@ -25,6 +25,12 @@ toolchain (`channel = "esp"` in `rust-toolchain.toml`), not upstream
 stable/nightly. `.cargo/config.toml` sets the target, `build-std`, and the
 runner (`espflash flash --monitor`).
 
+`rust-toolchain.toml` can't pin a version — espup always installs the
+toolchain as plain `esp` — so the real pin is the `version:` input to
+`esp-rs/xtensa-toolchain` in the CI workflow, currently `1.95.0`. If a
+local build behaves differently from CI, check `rustc +esp -vV` against
+that and `espup update` if it's behind.
+
 Run `source ~/export-esp.sh` before any `cargo build`/`clippy`/`run` —
 it puts the xtensa-gcc toolchain on `PATH`, which the linker needs. Without
 it the build fails at the link step, not at compile time.
