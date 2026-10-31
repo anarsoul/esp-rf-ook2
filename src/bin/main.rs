@@ -104,6 +104,8 @@ struct Tally {
     bad_constant: u32,
     shifted: u32,
     other: u32,
+    /// Valid frames from a sensor other than the one locked onto.
+    foreign: u32,
     rmt_errors: u32,
 }
 
@@ -115,6 +117,11 @@ impl Tally {
     fn decoded(&mut self) {
         self.captures += 1;
         self.decoded += 1;
+    }
+
+    fn foreign(&mut self) {
+        self.captures += 1;
+        self.foreign += 1;
     }
 
     fn failed(&mut self, err: &DecodeError) {
@@ -142,7 +149,7 @@ impl core::fmt::Display for Tally {
         write!(
             f,
             "{} captures: {} decoded, {} truncated, {} off grid, {} ambiguous, \
-             {} bad payload, {} started early, {} other; {} RMT errors",
+             {} bad payload, {} started early, {} other, {} other sensor; {} RMT errors",
             self.captures,
             self.decoded,
             self.truncated,
@@ -151,6 +158,7 @@ impl core::fmt::Display for Tally {
             self.bad_constant,
             self.shifted,
             self.other,
+            self.foreign,
             self.rmt_errors
         )
     }
@@ -373,6 +381,13 @@ async fn main(spawner: Spawner) -> ! {
     // them, and the protocol has no checksum, so a single decode is not
     // trusted on its own and one corrupt decode must not veto the rest.
     let mut vote = Vote::default();
+    // The sensor this receiver reports: the id of the first burst whose
+    // decodes agreed. Every Nexus-TH within range shares channel 1 and the
+    // frame has no other identity, and a neighbour's sensor was published
+    // for a while before ids were logged. The id changes with a battery
+    // swap, so a new battery means a reset to lock again; the publisher's
+    // five-minute staleness panic does that by itself.
+    let mut sensor_id: Option<u8> = None;
     let mut last_decode: Option<Instant> = None;
     // Every capture's fate, and when it was last logged.
     let mut tally = Tally::default();
@@ -431,9 +446,13 @@ async fn main(spawner: Spawner) -> ! {
                     // whole once it is over, see BURST_GAP. A line per decode
                     // cost dead time in the middle of the burst.
                     debug!("Decoded {}", describe(&parsed));
-                    tally.decoded();
-                    vote.add(parsed);
-                    last_decode = Some(Instant::now());
+                    if sensor_id.is_some_and(|id| id != parsed.id) {
+                        tally.foreign();
+                    } else {
+                        tally.decoded();
+                        vote.add(parsed);
+                        last_decode = Some(Instant::now());
+                    }
                 }
                 Err(e) => {
                     tally.failed(&e);
@@ -452,6 +471,10 @@ async fn main(spawner: Spawner) -> ! {
             // last line, which holds the burst's own captures.
             match vote.winner() {
                 Some(data) => {
+                    if sensor_id.is_none() {
+                        sensor_id = Some(data.id);
+                        info!("Locked to sensor id {}", data.id);
+                    }
                     info!(
                         "Burst: {} decodes, {}; {tally}",
                         vote.decodes(),

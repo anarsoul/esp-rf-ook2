@@ -58,6 +58,11 @@ MQTT_PASSWORD=your_mqtt_password
 MQTT_TOPIC=your_mqtt_topic
 ```
 
+The receiver locks onto the sensor id of the first burst it decodes and
+ignores other Nexus-TH sensors from then on. The id changes when the
+sensor's battery is replaced; reset the board to lock onto the new one (it
+resets itself after five minutes without a published reading).
+
 The app will publish JSON with temperature and humidity data, example:
 ```
 {"time" : "2024-11-02 12:05:31 UTC", "model" : "Nexus-TH", "id" : 174, "channel" : 1, "battery_ok" : 1, "temperature_C" : 10.100, "humidity" : 91}

@@ -174,6 +174,14 @@ modules, each owning one concern:
   buffers, not owned/leaked ones (see `1bd2c1d Stop sharing buffers for the
   sockets`).
 
+`main.rs` locks onto one sensor: the id of the first burst whose decodes
+agree, after which frames carrying another id are only tallied ("other
+sensor"). Every Nexus-TH in range shares channel 1 and the frame has no
+other identity; a neighbour's sensor was published for a while before ids
+were logged. The id changes with a battery swap, so a new battery needs a
+reset to lock again, which the publisher's five-minute staleness panic
+produces by itself.
+
 Cross-task coordination in `main.rs` uses an `embassy_sync::channel::Channel`
 (`MQTT_CHANNEL`) to hand the burst's winning `SensorData` + timestamp from
 the main RMT receive loop to a separate `mqtt_publisher` embassy task, so a
