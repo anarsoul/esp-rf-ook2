@@ -213,7 +213,11 @@ fn format_codes(codes: &[PulseCode]) -> String {
     out
 }
 
-static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, (SensorData, i64), 2> = Channel::new();
+/// A burst's winning reading, the time it was received and how many
+/// frames of the burst decoded, agreeing or not. The count goes out with
+/// the reading so a weakening signal shows in the broker's record, not
+/// only on a serial console nobody is watching.
+static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, (SensorData, i64, u32), 2> = Channel::new();
 
 fn get_timestamp() -> u64 {
     esp_hal::time::Instant::now()
@@ -241,7 +245,7 @@ fn to_pulse(pulse: PulseCode) -> Pulse {
 async fn mqtt_publisher(mqtt: &'static mut Mqtt, now: i64) {
     let mut last_publish: i64 = now;
     loop {
-        let (data, timestamp) = MQTT_CHANNEL.receive().await;
+        let (data, timestamp, decodes) = MQTT_CHANNEL.receive().await;
 
         if timestamp - last_publish > 300_000_000 {
             // Last successful publish was over 5 minutes ago, so something is wrong.
@@ -255,7 +259,7 @@ async fn mqtt_publisher(mqtt: &'static mut Mqtt, now: i64) {
             .strftime("%Y-%m-%d %H:%M:%S UTC");
         let topic = format!("{}/{}", MQTT_TOPIC, data.model());
         let data = format!(
-            "{{\"time\" : \"{}\", \"model\" : \"{}\", \"id\" : {}, \"channel\" : {}, \"battery_ok\" : {}, \"temperature_C\" : {}{}.{}, \"humidity\" : {}, \"uptime\" : {} }}",
+            "{{\"time\" : \"{}\", \"model\" : \"{}\", \"id\" : {}, \"channel\" : {}, \"battery_ok\" : {}, \"temperature_C\" : {}{}.{}, \"humidity\" : {}, \"decodes\" : {}, \"uptime\" : {} }}",
             date_time,
             data.model(),
             data.id,
@@ -265,6 +269,7 @@ async fn mqtt_publisher(mqtt: &'static mut Mqtt, now: i64) {
             data.temp_int,
             data.temp_decimal,
             data.humidity,
+            decodes,
             get_timestamp(),
         );
         match mqtt.publish(topic.as_str(), data.as_str()).await {
@@ -415,7 +420,7 @@ async fn run(
                         describe(&data)
                     );
                     MQTT_CHANNEL
-                        .send((data, rtc.current_time_us() as i64))
+                        .send((data, rtc.current_time_us() as i64, vote.decodes()))
                         .await;
                 }
                 None => warn!(

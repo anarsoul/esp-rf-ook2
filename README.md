@@ -65,5 +65,9 @@ resets itself after five minutes without a published reading).
 
 The app will publish JSON with temperature and humidity data, example:
 ```
-{"time" : "2024-11-02 12:05:31 UTC", "model" : "Nexus-TH", "id" : 174, "channel" : 1, "battery_ok" : 1, "temperature_C" : 10.100, "humidity" : 91}
+{"time" : "2024-11-02 12:05:31 UTC", "model" : "Nexus-TH", "id" : 174, "channel" : 1, "battery_ok" : true, "temperature_C" : 10.1, "humidity" : 91, "decodes" : 9, "uptime" : 86400123 }
 ```
+
+`decodes` is how many of the burst's repeats decoded, agreeing with the
+published reading or not; the sensor sends about a dozen, so a count that
+falls over time is a weakening signal. `uptime` is milliseconds since boot.
