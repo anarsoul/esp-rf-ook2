@@ -28,7 +28,7 @@ use embassy_sync::{
 use log::{debug, info, warn};
 
 use esp_rf_ook2::MQTT_TOPIC;
-use esp_rf_ook2::decoder::{DecodeError, Pulse, PulseLevel, SensorData, decode};
+use esp_rf_ook2::decoder::{DecodeError, Pulse, PulseLevel, SensorData, Vote, decode};
 use esp_rf_ook2::mqtt::Mqtt;
 use esp_rf_ook2::ntpc::Ntpc;
 use esp_rf_ook2::wifi::Wifi;
@@ -57,6 +57,14 @@ macro_rules! mk_static {
 esp_bootloader_esp_idf::esp_app_desc!();
 
 static SHARED_STACK: StaticCell<Mutex<NoopRawMutex, Stack<'static>>> = StaticCell::new();
+
+/// Silence after a decode that ends the burst. Nexus-TH repeats its frame
+/// about every 80 ms, a dozen times, so a burst lasts about a second, and
+/// then goes quiet for about a minute. Only successful decodes reset the
+/// clock, and with a weak signal most repeats fail, so the gap must cover
+/// a whole burst between two decodes: the bench board saw one decode at
+/// each end of a burst 0.5 s apart, which a 500 ms gap split in two.
+const BURST_GAP: Duration = Duration::from_secs(2);
 
 static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, (SensorData, i64), 2> = Channel::new();
 
@@ -215,9 +223,13 @@ async fn main(spawner: Spawner) -> ! {
             .expect("Failed to spawn MQTT sender task"),
     );
 
-    let mut measurement = SensorData::default();
-    let mut measurement_cnt = 0;
-    let mut last_publish = rtc.current_time_us();
+    // Decodes of the burst in progress, and when the last one arrived.
+    // A burst is tallied as a whole once it has gone quiet: the sensor
+    // repeats one frame a dozen times, a weak signal yields only some of
+    // them, and the protocol has no checksum, so a single decode is not
+    // trusted on its own and one corrupt decode must not veto the rest.
+    let mut vote = Vote::default();
+    let mut last_decode: Option<Instant> = None;
 
     loop {
         wdt.feed();
@@ -266,18 +278,8 @@ async fn main(spawner: Spawner) -> ! {
                             parsed.temp_decimal,
                             parsed.humidity
                         );
-                        if !measurement.equal(&parsed) {
-                            measurement = parsed;
-                            measurement_cnt = 1;
-                        } else {
-                            let now = rtc.current_time_us();
-                            if measurement_cnt == 3 && now - last_publish > 5_000_000 {
-                                MQTT_CHANNEL.send((parsed, now as i64)).await;
-                                last_publish = now;
-                            } else if measurement_cnt < 3 {
-                                measurement_cnt += 1;
-                            }
-                        }
+                        vote.add(parsed);
+                        last_decode = Some(Instant::now());
                     }
                     Err(e) => match e {
                         DecodeError::WrongPayloadLen(_len) => {}
@@ -292,6 +294,26 @@ async fn main(spawner: Spawner) -> ! {
                 // keep them out of the default log.
                 debug!("RMT receive error: {e:?}");
             }
+        }
+
+        // The burst is over once no decode has arrived for BURST_GAP;
+        // this runs at least once a second thanks to the timeout below.
+        if let Some(since) = last_decode
+            && since.elapsed() > BURST_GAP
+        {
+            match vote.winner() {
+                Some(data) => {
+                    MQTT_CHANNEL
+                        .send((data, rtc.current_time_us() as i64))
+                        .await;
+                }
+                None => warn!(
+                    "Burst of {} decode(s) had no two in agreement, dropped",
+                    vote.decodes()
+                ),
+            }
+            vote.clear();
+            last_decode = None;
         }
 
         match select(a, b).await {

@@ -114,8 +114,16 @@ modules, each owning one concern:
   this crate has no `esp_hal` dependency on the host target (only
   target-gated for `xtensa`, to keep the `#[ram]` placement of hot
   functions on-device); `main.rs` converts `PulseCode` → `Pulse` at the
-  RMT call site (`to_pulse`/`to_pulse_level`). Safe to reason about and
-  modify without touching networking code.
+  RMT call site (`to_pulse`/`to_pulse_level`). It also holds `Vote`, the
+  per-burst tally `main.rs` feeds every successful decode into: the sensor
+  repeats one frame about a dozen times per burst, a weak signal yields
+  only some of them, and the protocol has no checksum, so a reading is
+  published only when at least `MIN_VOTES` (2) decodes in the burst agree
+  (grouped by `SensorData::equal`, which ignores id/channel/battery) and
+  nothing ties with it. The old "same reading four times in a row" counter
+  carried state across bursts and never published a reading that changed
+  every minute. Safe to reason about and modify without touching
+  networking code.
 - **`wifi.rs`** — owns the `esp_radio` WiFi controller and the
   `embassy-net` `Stack`. Runs its own reconnect loop as a spawned embassy
   task (`connection`), plus a `net_task` running the `embassy-net`
@@ -145,9 +153,12 @@ modules, each owning one concern:
   sockets`).
 
 Cross-task coordination in `main.rs` uses an `embassy_sync::channel::Channel`
-(`MQTT_CHANNEL`) to hand decoded `SensorData` + timestamp from the main RMT
-receive loop to a separate `mqtt_publisher` embassy task, so a slow/blocked
-MQTT publish never stalls signal decoding. `mk_static!` (local macro) is
+(`MQTT_CHANNEL`) to hand the burst's winning `SensorData` + timestamp from
+the main RMT receive loop to a separate `mqtt_publisher` embassy task, so a
+slow/blocked MQTT publish never stalls signal decoding. A burst is closed
+`BURST_GAP` (2 s) after its last successful decode (failed repeats do not
+extend it, and a burst lasts about a second); the loop's 1 s receive
+timeout guarantees that check runs even when the air goes quiet. `mk_static!` (local macro) is
 the stable-Rust substitute for `static_cell::make_static!` — used anywhere
 a value needs `'static` lifetime for a spawned task.
 

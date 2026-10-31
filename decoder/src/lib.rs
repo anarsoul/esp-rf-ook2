@@ -66,7 +66,7 @@ pub enum DecodeError {
     UnpackFailed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct SensorData {
     model: [u8; 32],
     pub sign: i8,
@@ -129,6 +129,85 @@ impl SensorData {
             && self.temp_int == a.temp_int
             && self.temp_decimal == a.temp_decimal
             && self.humidity == a.humidity
+    }
+}
+
+/// Distinct readings a burst can carry. The sensor repeats one frame, so
+/// anything beyond the first is a corrupt decode; the protocol has no
+/// checksum and a flipped low bit passes validation as a nearby reading.
+pub const MAX_CANDIDATES: usize = 4;
+
+/// Decodes a reading needs before it is trusted. One is a possible bit
+/// flip; two identical decodes of a 36-bit frame are not a coincidence.
+pub const MIN_VOTES: u8 = 2;
+
+/// Tally of the decodes from one transmission burst. Readings are grouped
+/// with [`SensorData::equal`]; [`Vote::winner`] names the one the burst
+/// agrees on, and the caller decides when the burst is over.
+#[derive(Debug, Default)]
+pub struct Vote {
+    candidates: [Option<(SensorData, u8)>; MAX_CANDIDATES],
+}
+
+impl Vote {
+    /// Count one decode. Once [`MAX_CANDIDATES`] distinct readings are
+    /// held, further new ones are dropped: they are noise, and a real
+    /// reading already present keeps counting.
+    #[cfg_attr(target_arch = "xtensa", esp_hal::ram)]
+    pub fn add(&mut self, data: SensorData) {
+        for slot in self.candidates.iter_mut() {
+            match slot {
+                Some((seen, count)) if seen.equal(&data) => {
+                    *count = count.saturating_add(1);
+                    return;
+                }
+                Some(_) => {}
+                None => {
+                    *slot = Some((data, 1));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether any decode has been counted.
+    pub fn is_empty(&self) -> bool {
+        self.candidates[0].is_none()
+    }
+
+    /// Decodes counted so far, agreeing or not.
+    pub fn decodes(&self) -> u32 {
+        self.candidates
+            .iter()
+            .flatten()
+            .map(|(_, count)| u32::from(*count))
+            .sum()
+    }
+
+    /// The reading with the most decodes, if it has at least [`MIN_VOTES`]
+    /// and no other reading ties with it.
+    pub fn winner(&self) -> Option<SensorData> {
+        let mut best: Option<(SensorData, u8)> = None;
+        let mut tied = false;
+        for (data, count) in self.candidates.iter().flatten() {
+            match best {
+                Some((_, best_count)) if *count < best_count => {}
+                Some((_, best_count)) if *count == best_count => tied = true,
+                _ => {
+                    best = Some((*data, *count));
+                    tied = false;
+                }
+            }
+        }
+        match best {
+            Some((data, count)) if count >= MIN_VOTES && !tied => Some(data),
+            _ => None,
+        }
+    }
+
+    /// Forget the burst.
+    pub fn clear(&mut self) {
+        self.candidates = [None; MAX_CANDIDATES];
     }
 }
 
@@ -514,5 +593,68 @@ mod tests {
         let err = decode(&pulses, 1, PAYLOAD_LEN_BITS + 1).unwrap_err();
 
         assert!(matches!(err, DecodeError::TempOutOfRange(1, 60)));
+    }
+
+    fn reading(temp_int: u16, temp_decimal: u16, humidity: u8) -> SensorData {
+        SensorData::new("Nexus-TH", 1, temp_int, temp_decimal, humidity, true, 1, 0)
+    }
+
+    #[test]
+    fn vote_needs_two_agreeing_decodes() {
+        let mut vote = Vote::default();
+        assert!(vote.is_empty());
+        assert!(vote.winner().is_none());
+        vote.add(reading(21, 3, 45));
+        assert!(!vote.is_empty());
+        assert!(vote.winner().is_none(), "one decode may be a bit flip");
+        vote.add(reading(21, 3, 45));
+        let w = vote.winner().expect("two identical decodes agree");
+        assert!(w.equal(&reading(21, 3, 45)));
+    }
+
+    #[test]
+    fn vote_ignores_a_corrupt_decode_among_good_ones() {
+        let mut vote = Vote::default();
+        vote.add(reading(21, 3, 45));
+        vote.add(reading(21, 7, 45)); // flipped bit in the decimal
+        vote.add(reading(21, 3, 45));
+        vote.add(reading(21, 3, 45));
+        assert_eq!(vote.decodes(), 4);
+        assert!(vote.winner().unwrap().equal(&reading(21, 3, 45)));
+    }
+
+    #[test]
+    fn vote_rejects_a_tie() {
+        let mut vote = Vote::default();
+        vote.add(reading(21, 3, 45));
+        vote.add(reading(21, 3, 46));
+        vote.add(reading(21, 3, 45));
+        vote.add(reading(21, 3, 46));
+        assert!(vote.winner().is_none());
+        vote.add(reading(21, 3, 46));
+        assert!(vote.winner().unwrap().equal(&reading(21, 3, 46)));
+    }
+
+    #[test]
+    fn vote_keeps_counting_a_known_reading_when_full() {
+        let mut vote = Vote::default();
+        for h in 0..MAX_CANDIDATES as u8 {
+            vote.add(reading(21, 3, 40 + h));
+        }
+        vote.add(reading(21, 3, 99)); // dropped: no slot left
+        vote.add(reading(21, 3, 99));
+        assert!(vote.winner().is_none());
+        vote.add(reading(21, 3, 42)); // already held, still counts
+        assert!(vote.winner().unwrap().equal(&reading(21, 3, 42)));
+    }
+
+    #[test]
+    fn vote_clear_forgets_the_burst() {
+        let mut vote = Vote::default();
+        vote.add(reading(21, 3, 45));
+        vote.add(reading(21, 3, 45));
+        vote.clear();
+        assert!(vote.is_empty());
+        assert!(vote.winner().is_none());
     }
 }
