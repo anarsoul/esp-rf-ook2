@@ -9,6 +9,12 @@ rustflags = [
 
 [env]
 ESP_LOG="info"
+# esp-hal 1.2 defaults the ESP32 minimum chip revision to v3.0 and bakes it
+# into the ELF metadata; espflash 4.7+ refuses to flash an older chip and
+# `esp_hal::init` asserts it at boot, so `--force` would only move the
+# failure. The board in use is an ESP32 v1.0. With the floor at 0 esp-hal
+# reads the revision from efuse at run time to pick its errata workarounds.
+ESP_HAL_CONFIG_MIN_CHIP_REVISION="0"
 
 # Run the decoder crate's unit tests on the host. Must be invoked as
 # `cargo +stable test-decoder`: the `[unstable]` build-std below is

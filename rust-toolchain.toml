@@ -1,6 +1,6 @@
 # espup installs the Xtensa toolchain under the name `esp`, so there is no
 # version to pin here -- whichever release you last ran `espup install` with
-# is what you get. CI pins the exact version (currently 1.95.0) via
+# is what you get. CI pins the exact version (currently 1.97.0) via
 # esp-rs/xtensa-toolchain in .github/workflows/rust_ci.yml; keep the two in
 # sync, and run `espup update` if a local build disagrees with CI.
 [toolchain]

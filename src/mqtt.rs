@@ -1,3 +1,5 @@
+use core::num::NonZero;
+
 use embassy_net::{IpAddress, Stack, dns::DnsQueryType, tcp::TcpSocket};
 use embassy_sync::{blocking_mutex::raw::NoopRawMutex, mutex::Mutex};
 use embassy_time::{Duration, Timer};
@@ -7,15 +9,29 @@ use crate::{MQTT_LOGIN, MQTT_PASSWORD, MQTT_SERVER, RX_BUFFER_SIZE, TX_BUFFER_SI
 use log::{debug, warn};
 
 use rust_mqtt::{
-    client::{client::MqttClient, client_config::ClientConfig as MqttClientConfig},
-    packet::v5::publish_packet::QualityOfService::QoS0,
-    utils::rng_generator::CountingRng,
+    Bytes,
+    buffer::BumpBuffer,
+    client::{
+        Client,
+        options::{ConnectOptions, DisconnectOptions, PublicationOptions, TopicReference},
+    },
+    config::KeepAlive,
+    types::{MqttBinary, MqttString, TopicName},
 };
+
+/// Space for the dynamically sized fields of the packets the broker sends
+/// us. We publish at QoS 0, so that is a CONNACK and nothing else.
+const PACKET_BUFFER_SIZE: usize = 512;
+
+const CLIENT_ID: &str = "esp-rf-ook2";
+const KEEP_ALIVE_SECS: u16 = 30;
 
 #[derive(Debug)]
 pub enum Error {
     DnsResolveFailed,
     ConnectionFailed,
+    /// The topic or a credential is not a valid MQTT string.
+    InvalidArgument,
     PublishFailed,
     DisconnectFailed,
     FlushError,
@@ -90,43 +106,42 @@ impl Mqtt {
         topic: &str,
         data: &str,
     ) -> Result<(), Error> {
-        let mut config = MqttClientConfig::new(
-            rust_mqtt::client::client_config::MqttVersion::MQTTv5,
-            CountingRng(20000),
-        );
-        config.add_max_subscribe_qos(rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1);
-        config.add_client_id("esp-rf-ook2");
-        config.max_packet_size = 100;
-        config.keep_alive = 30;
+        let topic =
+            TopicName::new(MqttString::try_from(topic).map_err(|_| Error::InvalidArgument)?)
+                .ok_or(Error::InvalidArgument)?;
+        let user_name = MqttString::try_from(MQTT_LOGIN).map_err(|_| Error::InvalidArgument)?;
+        let password = MqttBinary::try_from(MQTT_PASSWORD).map_err(|_| Error::InvalidArgument)?;
+        let client_id = MqttString::try_from(CLIENT_ID).map_err(|_| Error::InvalidArgument)?;
 
-        config.add_username(MQTT_LOGIN);
-        config.add_password(MQTT_PASSWORD);
+        let mut packet_buf = [0u8; PACKET_BUFFER_SIZE];
+        let mut buffer = BumpBuffer::new(&mut packet_buf);
+        // One connection, one QoS 0 publish, no subscriptions: the smallest
+        // session the client allows. The socket is lent, not moved, so it
+        // can be flushed and closed by the caller whatever happens here.
+        let mut client = Client::<'_, '_, _, _, 0, 1, 1, 0, 0, 0, 0>::new(&mut buffer);
 
-        let mut writebuf = [0; 256];
-        let mut readbuf = [0; 256];
-        let mut client = {
-            let writebuf_len = writebuf.len();
-            let readbuf_len = readbuf.len();
-            MqttClient::<_, 5, _>::new(
-                socket,
-                &mut writebuf,
-                writebuf_len,
-                &mut readbuf,
-                readbuf_len,
-                config,
-            )
-        };
+        let connect_options = ConnectOptions::new()
+            .clean_start()
+            .keep_alive(KeepAlive::Seconds(
+                NonZero::new(KEEP_ALIVE_SECS).expect("keep-alive is non-zero"),
+            ))
+            .user_name(user_name)
+            .password(password);
 
-        client.connect_to_broker().await.map_err(|e| {
-            self.addr = None; // Clear cached address on failure
-            warn!("Error: {:?}", e);
-            Error::ConnectionFailed
-        })?;
+        client
+            .connect(&mut *socket, &connect_options, Some(client_id))
+            .await
+            .map_err(|e| {
+                self.addr = None; // Clear cached address on failure
+                warn!("Error: {:?}", e);
+                Error::ConnectionFailed
+            })?;
 
         debug!("Connected to MQTT broker");
 
+        let publication = PublicationOptions::new(TopicReference::Name(topic.as_borrowed()));
         client
-            .send_message(topic, data.as_bytes(), QoS0, false)
+            .publish(&publication, Bytes::from(data.as_bytes()))
             .await
             .map_err(|e| {
                 self.addr = None; // Clear cached address on failure
@@ -134,13 +149,16 @@ impl Mqtt {
                 Error::PublishFailed
             })?;
 
-        debug!("Published to topic {}", topic);
+        debug!("Published to topic {}", topic.as_ref().as_str());
 
-        client.disconnect().await.map_err(|e| {
-            self.addr = None; // Clear cached address on failure
-            warn!("Error: {:?}", e);
-            Error::DisconnectFailed
-        })?;
+        client
+            .disconnect(&DisconnectOptions::new())
+            .await
+            .map_err(|e| {
+                self.addr = None; // Clear cached address on failure
+                warn!("Error: {:?}", e);
+                Error::DisconnectFailed
+            })?;
 
         Ok(())
     }

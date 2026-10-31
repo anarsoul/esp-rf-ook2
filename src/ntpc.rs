@@ -10,6 +10,7 @@ use embassy_time::{Duration, Timer};
 use crate::{NTP_SERVER, RX_BUFFER_SIZE, TX_BUFFER_SIZE};
 
 use sntpc::{NtpContext, NtpTimestampGenerator, get_time};
+use sntpc_net_embassy::UdpSocketWrapper;
 
 use embassy_futures::select::{Either, select};
 
@@ -83,6 +84,10 @@ impl Ntpc {
             NtpcError::SocketBindFailed
         })?;
 
+        // sntpc talks to the socket through this adapter, which owns it;
+        // dropping the adapter below closes the socket.
+        let socket = UdpSocketWrapper::new(socket);
+
         let a = get_time(
             SocketAddr::from((addr, 123)),
             &socket,
@@ -94,7 +99,7 @@ impl Ntpc {
 
         let result = match result {
             Either::First(res) => {
-                res.map(|r| r.sec() as u64).map_err(|e| {
+                res.map(|r| r.sec()).map_err(|e| {
                     self.addr = None; // Clear cached address on failure
                     warn!("NTP get_time error: {:?}", e);
                     NtpcError::Timeout
@@ -103,10 +108,9 @@ impl Ntpc {
             Either::Second(_) => Err(NtpcError::Timeout),
         };
 
-        socket.flush().await;
-        Timer::after(Duration::from_millis(100)).await;
-        socket.close();
-        // Give stack some time to process the socket closure
+        drop(socket);
+        // Give stack some time to process the socket closure before the
+        // buffers above go out of scope
         Timer::after(Duration::from_millis(100)).await;
 
         result

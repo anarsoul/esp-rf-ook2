@@ -27,13 +27,22 @@ runner (`espflash flash --monitor`).
 
 `rust-toolchain.toml` can't pin a version — espup always installs the
 toolchain as plain `esp` — so the real pin is the `version:` input to
-`esp-rs/xtensa-toolchain` in the CI workflow, currently `1.95.0`. If a
+`esp-rs/xtensa-toolchain` in the CI workflow, currently `1.97.0`. If a
 local build behaves differently from CI, check `rustc +esp -vV` against
 that and `espup update` if it's behind.
 
 Run `source ~/export-esp.sh` before any `cargo build`/`clippy`/`run` —
 it puts the xtensa-gcc toolchain on `PATH`, which the linker needs. Without
 it the build fails at the link step, not at compile time.
+
+`.cargo/config.toml` also sets `ESP_HAL_CONFIG_MIN_CHIP_REVISION="0"`.
+esp-hal 1.2 dropped support for ESP32 silicon below v3.0 (esp-hal PR
+#5812, issue #5656: pre-v3.0 chips have a dual-core read erratum that
+corrupts `Instant::now`, issue #4903, and no workaround was accepted).
+The default of 300 is baked into the ELF metadata, which espflash 4.7+
+refuses to flash onto an older chip, and `esp_hal::init` asserts it at
+boot. The board this project runs on is an ESP32 v1.0, so the floor is
+lowered; this firmware only ever runs the first core. Do not remove it.
 
 Required env vars at build time (baked in via `env!()` in `src/lib.rs`, so
 missing ones are a hard build failure): `SSID`, `PASSWORD`, `MQTT_SERVER`,
@@ -104,8 +113,20 @@ modules, each owning one concern:
   modify without touching networking code.
 - **`wifi.rs`** — owns the `esp_radio` WiFi controller and the
   `embassy-net` `Stack`. Runs its own reconnect loop as a spawned embassy
-  task (`connection`) driven by a `Signal`, plus a `net_task` running the
-  `embassy-net` `Runner`. Exposes a `Wifi` struct with `stack: Stack<'static>`.
+  task (`connection`), plus a `net_task` running the `embassy-net`
+  `Runner`. Exposes a `Wifi` struct with `stack: Stack<'static>`. The
+  station picks its access point deliberately because esp-radio does not
+  roam and its default `Fast` scan takes the first beacon it hears:
+  `ScanMethod::AllChannels` makes the driver scan everything and connect to
+  the strongest BSSID, a candidate scan before each connect logs every AP
+  on the SSID with BSSID/channel/RSSI, and the transmit ceiling is raised
+  from esp-radio's 5 dBm default (`WIFI_MAX_TX_POWER_QDBM`). The stack is
+  created with no IPv4 config; DHCP is switched on 500 ms after each
+  connect (the driver says "connected" before it can pass a frame, and a
+  lost discover costs smoltcp's 10 s timeout) and off at disconnect. Ten
+  failed connects in a row panic, which resets the chip via `custom_halt`.
+  This mirrors `~/src/rust/esp32clock/src/net.rs`, the reference for Wi-Fi
+  handling on esp-radio.
 - **`ntpc.rs`** / **`mqtt.rs`** — both follow the same pattern: hold a
   shared `&'static Mutex<NoopRawMutex, Stack<'static>>` (the WiFi stack is
   shared across NTP/MQTT via a mutex since embassy-net sockets need

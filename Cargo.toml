@@ -1,7 +1,7 @@
 [package]
 edition      = "2024"
 name         = "esp-rf-ook2"
-rust-version = "1.88"
+rust-version = "1.95"
 version      = "0.1.0"
 
 [[bin]]
@@ -9,9 +9,9 @@ name = "esp-rf-ook2"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-hal = { version = "1.0.0", features = ["log-04", "esp32", "unstable"] }
+esp-hal = { version = "1.2.2", features = ["log-04", "esp32", "unstable"] }
 
-esp-rtos = { version = "0.2.0", features = [
+esp-rtos = { version = "0.4.0", features = [
   "log-04",
   "embassy",
   "esp-alloc",
@@ -19,48 +19,50 @@ esp-rtos = { version = "0.2.0", features = [
   "esp32",
 ] }
 
-esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32", "log-04"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32", "log-04"] }
 
-embassy-net = { version = "0.7.1", features = ["dhcpv4", "dhcpv4-hostname", "dns", "medium-ethernet", "tcp", "udp"] }
-esp-alloc = { version = "0.9.0" }
-esp-backtrace = { version = "0.18.1", features = [
+embassy-net = { version = "0.9.1", features = [
+  "dhcpv4",
+  "dhcpv4-hostname",
+  "dns",
+  "log",
+  "medium-ethernet",
+  "proto-ipv4",
+  "tcp",
+  "udp",
+] }
+esp-alloc = { version = "0.11.0", features = ["esp32"] }
+# `custom-halt` routes a panic to `custom_halt` in src/lib.rs, which resets
+# the chip at once instead of sitting halted until the watchdog fires.
+esp-backtrace = { version = "0.20.0", features = [
+  "custom-halt",
   "println",
   "esp32",
   "panic-handler",
 ] }
-esp-println = { version = "0.16.1", features = ["esp32", "log-04", "timestamp"] }
-embassy-executor = { version = "0.9.1" }
-embassy-time = { version = "0.5.0" }
-esp-radio = { version = "0.17.0", features = [
+esp-println = { version = "0.18.0", features = ["esp32", "log-04", "timestamp"] }
+embassy-executor = { version = "0.10.0" }
+embassy-time = { version = "0.5.1" }
+esp-radio = { version = "1.0.0-beta.1", features = [
   "log-04",
   "esp-alloc",
   "esp32",
-  "smoltcp",
   "unstable",
   "wifi",
-] }
-smoltcp = { version = "0.12.0", default-features = false, features = [
-  "log",
-  "medium-ethernet",
-  "multicast",
-  "proto-dhcpv4",
-  "proto-dns",
-  "proto-ipv4",
-  "socket-dns",
-  "socket-icmp",
-  "socket-tcp",
-  "socket-udp",
 ] }
 
 critical-section = "1.2.0"
 static_cell      = "2.1.1"
-sntpc = { version = "0.7.0", default-features = false, features = ["embassy-socket"] }
-heapless = { version = "0.8.0" }
-jiff = { version = "0.2.16", default-features = false, features = ["static", "alloc"] }
+sntpc             = { version = "0.11.0", default-features = false }
+sntpc-net-embassy = "0.11.0"
+heapless = { version = "0.9" }
+jiff = { version = "0.2.38", default-features = false, features = ["static", "alloc"] }
 log = "0.4.29"
-embassy-sync = { version = "0.7.2", features = ["log"] }
+embassy-sync = { version = "0.8.0", features = ["log"] }
 embassy-futures = { version = "0.1.2", features = ["log"] }
-rust-mqtt = { version = "0.3.1", default-features = false }
+# `bump`: received packets are parsed into a caller-provided slice, so the
+# MQTT client never touches the heap.
+rust-mqtt = { version = "0.6.0", default-features = false, features = ["v5", "bump", "log", "log-level-warn"] }
 decoder = { path = "decoder" }
 
 [workspace]

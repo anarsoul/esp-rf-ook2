@@ -17,7 +17,6 @@ use esp_hal::rng::Rng;
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::{MwdtStage, TimerGroup};
-use esp_radio::Controller;
 
 use embassy_sync::channel::Channel;
 use embassy_sync::{
@@ -132,10 +131,14 @@ async fn main(spawner: Spawner) -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
+    // Heap for the Wi-Fi driver and the rest. The reclaimed region is the
+    // largest single block; the second one is headroom for the driver's
+    // buffers and the per-publish allocations.
     esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 72 * 1024);
+    esp_alloc::heap_allocator!(size: 32 * 1024);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0);
+    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
 
     // Arm watchdog timer
     let mut wdt = timg0.wdt;
@@ -146,14 +149,9 @@ async fn main(spawner: Spawner) -> ! {
     wdt.enable();
     wdt.feed();
 
-    let rtc = Rtc::new(peripherals.LPWR);
-    let radio_init = &*mk_static!(
-        Controller<'static>,
-        esp_radio::init().expect("Failed to init radio")
-    );
-    let wifi = Wifi::new(radio_init, peripherals.WIFI, Rng::new(), spawner)
-        .await
-        .expect("Failed to initialize Wi-Fi");
+    let rtc = Rtc::new(peripherals.RTC_TIMER);
+    let wifi =
+        Wifi::new(peripherals.WIFI, Rng::new(), spawner).expect("Failed to initialize Wi-Fi");
 
     wdt.feed();
 
@@ -194,14 +192,16 @@ async fn main(spawner: Spawner) -> ! {
 
     let mut channel = rmt
         .channel0
-        .configure_rx(peripherals.GPIO21, rx_config)
-        .expect("Failed to configure RMT RX channel");
+        .configure_rx(&rx_config)
+        .expect("Failed to configure RMT RX channel")
+        .with_pin(peripherals.GPIO21);
     let mut data: [PulseCode; 64] = [PulseCode::default(); 64];
 
     let mqtt = &mut *mk_static!(Mqtt, Mqtt::new(shared_stack));
-    spawner
-        .spawn(mqtt_publisher(mqtt, rtc.current_time_us() as i64))
-        .expect("Failed to spawn MQTT sender task");
+    spawner.spawn(
+        mqtt_publisher(mqtt, rtc.current_time_us() as i64)
+            .expect("Failed to spawn MQTT sender task"),
+    );
 
     let mut measurement = SensorData::default();
     let mut measurement_cnt = 0;
