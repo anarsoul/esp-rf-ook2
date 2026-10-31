@@ -14,6 +14,27 @@ pub const MAX_HIGH: u16 = 2150;
 pub const MIN_LOW: u16 = 800;
 pub const MAX_LOW: u16 = 1100;
 
+/// Codes in one complete frame: one per bit, each a carrier pulse followed by
+/// the gap that encodes the bit, plus the closing pulse that ends the last
+/// gap, which the RMT stores with a zero-length second half as the end marker.
+pub const FRAME_LEN: usize = PAYLOAD_LEN_BITS + 1;
+
+/// Leading codes `decode` will discard before a frame. Two things put extra
+/// codes in front of a frame on the receiver and each costs exactly one:
+///
+/// - The RXB6's data slicer chatters while its AGC recovers from the gap
+///   between repeats, so a weak signal arrives with a junk pulse such as
+///   `High 650 / Low 150` ahead of the first real pulse.
+/// - The RMT was re-armed during the gap before the first pulse, so the first
+///   code holds a partial gap and the whole train pairs as (gap, pulse)
+///   instead of (pulse, gap). `decode` already reads the gap from whichever
+///   half is low, so the shifted frame decodes once the partial code is gone.
+///
+/// Both at once is two codes. The trim is fixed by the length alone, so a
+/// frame is never searched for; a frame with more leading codes than this is
+/// rejected as `WrongPayloadLen`.
+pub const MAX_LEADING_JUNK: usize = 2;
+
 /// Hardware-agnostic stand-in for `esp_hal::gpio::Level`, so this crate
 /// doesn't need `esp_hal` (and can be built/tested on the host) except for
 /// the `#[ram]` placement of hot functions on-device.
@@ -161,14 +182,26 @@ struct NexusTHPayload {
     humidity: Integer<u8, packed_bits::Bits<8>>,
 }
 
+/// Decode the first `len` codes of a received train. `len` may exceed a
+/// frame by up to [`MAX_LEADING_JUNK`] codes; the excess is dropped from the
+/// front, see that constant for why.
 #[cfg_attr(target_arch = "xtensa", esp_hal::ram)]
 pub fn decode(pulses: &[Pulse], ch: u8, len: usize) -> Result<SensorData, DecodeError> {
-    // len should be number of bits + terminator
-    if len != PAYLOAD_LEN_BITS + 1 {
+    if !(FRAME_LEN..=FRAME_LEN + MAX_LEADING_JUNK).contains(&len) {
         return Err(DecodeError::WrongPayloadLen(len));
     }
+    let frame = pulses
+        .get(len - FRAME_LEN..len)
+        .ok_or(DecodeError::WrongPayloadLen(len))?;
+    decode_frame(frame, ch)
+}
 
-    for entry in &pulses[..len] {
+/// Decode exactly one frame of [`FRAME_LEN`] codes.
+#[cfg_attr(target_arch = "xtensa", esp_hal::ram)]
+fn decode_frame(pulses: &[Pulse], ch: u8) -> Result<SensorData, DecodeError> {
+    debug_assert_eq!(pulses.len(), FRAME_LEN);
+
+    for entry in pulses {
         if let PulseLevel::High = entry.level1
             && !(PULSE_MIN..PULSE_MAX).contains(&entry.length1)
         {
@@ -182,10 +215,7 @@ pub fn decode(pulses: &[Pulse], ch: u8, len: usize) -> Result<SensorData, Decode
     }
 
     let mut samples: [u16; PAYLOAD_LEN_BITS] = [0; PAYLOAD_LEN_BITS];
-    for (idx, entry) in pulses.iter().enumerate() {
-        if idx == len || idx == PAYLOAD_LEN_BITS {
-            break;
-        }
+    for (idx, entry) in pulses.iter().take(PAYLOAD_LEN_BITS).enumerate() {
         samples[idx] = if let PulseLevel::Low = entry.level1 {
             entry.length1
         } else {
@@ -248,6 +278,53 @@ mod tests {
             };
         }
         pulses
+    }
+
+    // The same train as the RMT records it when re-armed during the gap
+    // before the first pulse: a partial gap first, then every code pairs a
+    // bit's gap with the pulse that follows it, and the end marker is on its
+    // own. One code longer than a clean frame.
+    fn payload_to_offset_pulses(bytes: &[u8; PAYLOAD_LEN_BYTES]) -> Vec<Pulse> {
+        let mut pulses = vec![Pulse {
+            level1: PulseLevel::Low,
+            length1: 300,
+            level2: PulseLevel::High,
+            length2: 400,
+        }];
+        for i in 0..PAYLOAD_LEN_BITS {
+            let bit_len = if bit_at(bytes, i) { 2000 } else { 900 };
+            pulses.push(Pulse {
+                level1: PulseLevel::Low,
+                length1: bit_len,
+                level2: PulseLevel::High,
+                length2: 400,
+            });
+        }
+        pulses.push(Pulse {
+            level1: PulseLevel::Low,
+            length1: 0,
+            level2: PulseLevel::Low,
+            length2: 0,
+        });
+        pulses
+    }
+
+    // The slicer chatter seen on the board ahead of a weak repeat's first pulse.
+    const JUNK: Pulse = Pulse {
+        level1: PulseLevel::High,
+        length1: 650,
+        level2: PulseLevel::Low,
+        length2: 150,
+    };
+
+    fn with_leading(junk: &[Pulse], frame: &[Pulse]) -> Vec<Pulse> {
+        junk.iter().chain(frame).copied().collect()
+    }
+
+    fn assert_same_reading(a: &SensorData, b: &SensorData) {
+        assert!(a.equal(b), "{a:?} != {b:?}");
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.battery_ok, b.battery_ok);
     }
 
     fn valid_payload_bytes(
@@ -349,6 +426,82 @@ mod tests {
         let err = decode(&pulses, 2, PAYLOAD_LEN_BITS + 1).unwrap_err();
 
         assert!(matches!(err, DecodeError::WrongChannel(1)));
+    }
+
+    #[test]
+    fn decodes_with_one_leading_junk_code() {
+        let bytes = valid_payload_bytes(174, true, 0, 101, 91);
+        let clean = payload_to_pulses(&bytes);
+        let pulses = with_leading(&[JUNK], &clean);
+        assert_eq!(pulses.len(), FRAME_LEN + 1);
+
+        let expected = decode(&clean, 1, FRAME_LEN).unwrap();
+        let res = decode(&pulses, 1, pulses.len()).unwrap();
+
+        assert_same_reading(&res, &expected);
+    }
+
+    #[test]
+    fn decodes_with_half_symbol_offset() {
+        let bytes = valid_payload_bytes(174, true, 0, 4096 - 101, 91);
+        let clean = payload_to_pulses(&bytes);
+        let pulses = payload_to_offset_pulses(&bytes);
+        assert_eq!(pulses.len(), FRAME_LEN + 1);
+
+        let expected = decode(&clean, 1, FRAME_LEN).unwrap();
+        let res = decode(&pulses, 1, pulses.len()).unwrap();
+
+        assert_same_reading(&res, &expected);
+        assert_eq!(res.sign, -1);
+    }
+
+    #[test]
+    fn decodes_with_junk_and_half_symbol_offset() {
+        let bytes = valid_payload_bytes(7, false, 1, 235, 40);
+        let clean = payload_to_pulses(&bytes);
+        let pulses = with_leading(&[JUNK], &payload_to_offset_pulses(&bytes));
+        assert_eq!(pulses.len(), FRAME_LEN + MAX_LEADING_JUNK);
+
+        let expected = decode(&clean, 2, FRAME_LEN).unwrap();
+        let res = decode(&pulses, 2, pulses.len()).unwrap();
+
+        assert_same_reading(&res, &expected);
+    }
+
+    #[test]
+    fn rejects_more_leading_codes_than_allowed() {
+        let bytes = valid_payload_bytes(1, true, 0, 200, 50);
+        let pulses = with_leading(&[JUNK; MAX_LEADING_JUNK + 1], &payload_to_pulses(&bytes));
+
+        let err = decode(&pulses, 1, pulses.len()).unwrap_err();
+
+        assert!(
+            matches!(err, DecodeError::WrongPayloadLen(len) if len == FRAME_LEN + MAX_LEADING_JUNK + 1)
+        );
+    }
+
+    #[test]
+    fn leading_junk_does_not_mask_a_bad_frame() {
+        let bytes = valid_payload_bytes(1, true, 0, 200, 50);
+        let mut clean = payload_to_pulses(&bytes);
+        clean[5].length1 = 700; // a bad pulse inside the frame proper
+        let pulses = with_leading(&[JUNK], &clean);
+
+        let err = decode(&pulses, 1, pulses.len()).unwrap_err();
+
+        // The junk code's 650 us pulse is out of range too, but it is the
+        // frame's own fault that is reported.
+        assert!(matches!(err, DecodeError::PulseOutOfRange(700)));
+    }
+
+    #[test]
+    fn rejects_len_beyond_the_buffer() {
+        let bytes = valid_payload_bytes(1, true, 0, 200, 50);
+        let pulses = payload_to_pulses(&bytes);
+
+        let err = decode(&pulses, 1, FRAME_LEN + 1).unwrap_err();
+
+        assert!(matches!(err, DecodeError::WrongPayloadLen(len) if len == FRAME_LEN + 1));
     }
 
     #[test]

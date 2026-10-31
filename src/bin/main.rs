@@ -7,7 +7,7 @@
 )]
 
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
@@ -23,7 +23,7 @@ use embassy_sync::{
     blocking_mutex::raw::{CriticalSectionRawMutex, NoopRawMutex},
     mutex::Mutex,
 };
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use esp_rf_ook2::MQTT_TOPIC;
 use esp_rf_ook2::decoder::{DecodeError, Pulse, PulseLevel, SensorData, decode};
@@ -177,7 +177,7 @@ async fn main(spawner: Spawner) -> ! {
     let time = ntpc.get_time().await.expect("Failed to get NTP time");
     rtc.set_current_time_us(time * 1_000_000);
 
-    let mut last_time_sync = rtc.current_time_us();
+    let mut last_time_sync = Instant::now();
     let now = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
 
     info!("now is {now}");
@@ -195,7 +195,17 @@ async fn main(spawner: Spawner) -> ! {
         .configure_rx(&rx_config)
         .expect("Failed to configure RMT RX channel")
         .with_pin(peripherals.GPIO21);
-    let mut data: [PulseCode; 64] = [PulseCode::default(); 64];
+    // Two capture buffers: the RMT fills one while the other is decoded.
+    // Nexus-TH leaves about 4 ms between repeats and the receiver ends a
+    // frame 3 ms into that gap, so the next capture must be armed within
+    // the remaining millisecond or its first code is a partial gap. Arming
+    // first and decoding afterwards keeps decode, logging and MQTT
+    // hand-off out of that window.
+    let mut buffers: [[PulseCode; 64]; 2] = [[PulseCode::default(); 64]; 2];
+    // Which buffer the next capture goes into; the other holds `finished`.
+    let mut filling = 0usize;
+    // Result of the capture that just completed into the other buffer.
+    let mut finished: Option<Result<usize, esp_hal::rmt::Error>> = None;
 
     let mqtt = &mut *mk_static!(Mqtt, Mqtt::new(shared_stack));
     spawner.spawn(
@@ -209,12 +219,14 @@ async fn main(spawner: Spawner) -> ! {
 
     loop {
         wdt.feed();
-        // Re-sync time every 3_600 seconds (1 hour)
-        if rtc.current_time_us() - last_time_sync > 3_600_000_000 {
+        // Re-sync time every hour. Checked against the cheap monotonic
+        // clock; reading the RTC costs a register handshake and sits on the
+        // re-arm path below.
+        if last_time_sync.elapsed() > Duration::from_secs(3_600) {
             info!("Re-syncing time via NTP...");
             let time = ntpc.get_time().await.expect("Failed to get NTP time");
             rtc.set_current_time_us(time * 1_000_000);
-            last_time_sync = rtc.current_time_us();
+            last_time_sync = Instant::now();
             let last_ts = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
 
             info!("now is {last_ts}");
@@ -226,21 +238,23 @@ async fn main(spawner: Spawner) -> ! {
         // The actual data is encoded in the lenght of the low pulse (pauses)
         // 1 is 1650-2150 uS, 0 is 800-1100 uS
         //
-        // On ESP32 RMT can count the lenght of pulses for us, simplifying the decoding
-        let a = channel.receive(&mut data);
+        // On ESP32 RMT can count the lenght of pulses for us, simplifying the decoding.
+        // `receive` starts the hardware before the future is first polled, so
+        // the receiver is armed from here on while the previous capture is
+        // decoded below.
+        let [first, second] = &mut buffers;
+        let (fill, done) = if filling == 0 {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let a = channel.receive(fill);
         let b = Timer::after(Duration::from_secs(1));
 
-        let either = select(a, b).await;
-        wdt.feed();
-        let res = match either {
-            Either::First(res) => res,
-            Either::Second(_) => {
-                continue;
-            }
-        };
-        match res {
-            Ok(symbol_count) => {
-                let pulses: [Pulse; 64] = core::array::from_fn(|i| to_pulse(data[i]));
+        match finished.take() {
+            None => {}
+            Some(Ok(symbol_count)) => {
+                let pulses: [Pulse; 64] = core::array::from_fn(|i| to_pulse(done[i]));
                 match decode(&pulses, 1, symbol_count) {
                     Ok(parsed) => {
                         info!(
@@ -271,7 +285,20 @@ async fn main(spawner: Spawner) -> ! {
                     },
                 }
             }
-            Err(_e) => {}
+            Some(Err(e)) => {
+                // Overflows and framing errors on a noisy line are routine;
+                // keep them out of the default log.
+                debug!("RMT receive error: {e:?}");
+            }
+        }
+
+        match select(a, b).await {
+            Either::First(res) => {
+                finished = Some(res);
+                filling ^= 1;
+            }
+            // Nothing arrived; the dropped future stopped the receiver.
+            Either::Second(_) => finished = None,
         }
     }
 }

@@ -104,7 +104,12 @@ modules, each owning one concern:
   decoding, and the one part of this codebase with unit tests. Converts a
   `Pulse`/`PulseLevel` pulse-width sample train into a `SensorData` via a
   `packed_struct` bitfield (`NexusTHPayload`), with range/channel/checksum-
-  style validation returning a `DecodeError`. `Pulse`/`PulseLevel` are
+  style validation returning a `DecodeError`. It tolerates up to
+  `MAX_LEADING_JUNK` (2) extra codes ahead of a frame: a slicer-chatter
+  junk pulse from a weak signal, or the partial gap recorded when the RMT
+  was re-armed mid-gap, which shifts every code to (gap, pulse). Both were
+  seen on the board to turn most of a Nexus burst's repeats into 38/39-code
+  trains that a strict 37-code check threw away. `Pulse`/`PulseLevel` are
   local stand-ins for `esp_hal::rmt::PulseCode`/`esp_hal::gpio::Level` —
   this crate has no `esp_hal` dependency on the host target (only
   target-gated for `xtensa`, to keep the `#[ram]` placement of hot
