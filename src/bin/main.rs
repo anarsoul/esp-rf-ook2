@@ -14,7 +14,7 @@ use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::ram;
-use esp_hal::rmt::{PulseCode, Rmt, RxChannelConfig, RxChannelCreator};
+use esp_hal::rmt::{CHANNEL_RAM_SIZE, PulseCode, Rmt, RxChannelConfig, RxChannelCreator};
 use esp_hal::rng::Rng;
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::time::Rate;
@@ -65,6 +65,15 @@ static SHARED_STACK: StaticCell<Mutex<NoopRawMutex, Stack<'static>>> = StaticCel
 /// a whole burst between two decodes: the bench board saw one decode at
 /// each end of a burst 0.5 s apart, which a 500 ms gap split in two.
 const BURST_GAP: Duration = Duration::from_secs(2);
+
+/// RMT memory blocks for the receive channel. The ESP32 has eight 64-code
+/// blocks shared by its eight channels and only channel 0 is in use, so
+/// taking four is free. The ESP32 cannot wrap a receive, so a capture that
+/// outgrows its memory is lost whole; with one block, 27 codes of slicer
+/// chatter ahead of a frame were enough to do that.
+const RX_MEM_BLOCKS: u8 = 4;
+/// Codes one capture can hold, and the size of each capture buffer.
+const RX_CODES: usize = RX_MEM_BLOCKS as usize * CHANNEL_RAM_SIZE;
 
 static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, (SensorData, i64), 2> = Channel::new();
 
@@ -197,8 +206,17 @@ async fn main(spawner: Spawner) -> ! {
     let rmt = Rmt::new(peripherals.RMT, freq).unwrap().into_async();
     let rx_config = RxChannelConfig::default()
         .with_clk_divider(80) // tick will be 1us (1MHz)
-        .with_idle_threshold(3000) // timeout after 3ms of inactivity
-        .with_filter_threshold(100); // filter out pulses shorter than 100us
+        // A gap this long ends the capture. The longest gap inside a frame
+        // is a 1 bit at about 2150 us and the gap after a frame is at least
+        // 3000 us, so this sits between the two; the lower it is, the sooner
+        // the capture ends and the more of the inter-repeat gap is left to
+        // re-arm the receiver in.
+        .with_idle_threshold(2600)
+        // The glitch filter counts APB clock periods (80 MHz), not channel
+        // ticks, and the register is 8 bits wide, so 255 is the most it can
+        // do: about 3.2 us. Anything longer is left to the decoder.
+        .with_filter_threshold(255)
+        .with_memsize(RX_MEM_BLOCKS);
 
     let mut channel = rmt
         .channel0
@@ -207,11 +225,11 @@ async fn main(spawner: Spawner) -> ! {
         .with_pin(peripherals.GPIO21);
     // Two capture buffers: the RMT fills one while the other is decoded.
     // Nexus-TH leaves about 4 ms between repeats and the receiver ends a
-    // frame 3 ms into that gap, so the next capture must be armed within
-    // the remaining millisecond or its first code is a partial gap. Arming
-    // first and decoding afterwards keeps decode, logging and MQTT
-    // hand-off out of that window.
-    let mut buffers: [[PulseCode; 64]; 2] = [[PulseCode::default(); 64]; 2];
+    // frame 2.6 ms into that gap (the idle threshold above), so the next
+    // capture must be armed within the remaining 1.4 ms or its first code
+    // is a partial gap. Arming first and decoding afterwards keeps decode,
+    // logging and MQTT hand-off out of that window.
+    let mut buffers: [[PulseCode; RX_CODES]; 2] = [[PulseCode::default(); RX_CODES]; 2];
     // Which buffer the next capture goes into; the other holds `finished`.
     let mut filling = 0usize;
     // Result of the capture that just completed into the other buffer.
@@ -262,38 +280,41 @@ async fn main(spawner: Spawner) -> ! {
         } else {
             (second, first)
         };
+        // A capture that overflows has no end marker; zeroes after its data
+        // give the decoder one, see `decoder::decode`.
+        fill.fill(PulseCode::default());
         let a = channel.receive(fill);
         let b = Timer::after(Duration::from_secs(1));
 
-        match finished.take() {
-            None => {}
-            Some(Ok(symbol_count)) => {
-                let pulses: [Pulse; 64] = core::array::from_fn(|i| to_pulse(done[i]));
-                match decode(&pulses[..symbol_count.min(pulses.len())], 1) {
-                    Ok(parsed) => {
-                        info!(
-                            "Temperature: {}{}.{}C, Humidity: {}%",
-                            { if parsed.sign < 0 { "-" } else { "" } },
-                            parsed.temp_int,
-                            parsed.temp_decimal,
-                            parsed.humidity
-                        );
-                        vote.add(parsed);
-                        last_decode = Some(Instant::now());
-                    }
-                    Err(e) => match e {
-                        // Most captures are noise blips far short of a frame.
-                        DecodeError::Truncated(_) => {}
-                        _ => {
-                            warn!("Decode error: {:?}", e);
-                        }
-                    },
-                }
-            }
-            Some(Err(e)) => {
+        // An errored capture is decoded all the same: on overflow the
+        // driver has copied what the hardware got before giving up, and it
+        // may well hold a frame.
+        if let Some(result) = finished.take() {
+            if let Err(e) = result {
                 // Overflows and framing errors on a noisy line are routine;
                 // keep them out of the default log.
                 debug!("RMT receive error: {e:?}");
+            }
+            let pulses: [Pulse; RX_CODES] = core::array::from_fn(|i| to_pulse(done[i]));
+            match decode(&pulses, 1) {
+                Ok(parsed) => {
+                    info!(
+                        "Temperature: {}{}.{}C, Humidity: {}%",
+                        { if parsed.sign < 0 { "-" } else { "" } },
+                        parsed.temp_int,
+                        parsed.temp_decimal,
+                        parsed.humidity
+                    );
+                    vote.add(parsed);
+                    last_decode = Some(Instant::now());
+                }
+                Err(e) => match e {
+                    // Most captures are noise blips far short of a frame.
+                    DecodeError::Truncated(_) => {}
+                    _ => {
+                        warn!("Decode error: {:?}", e);
+                    }
+                },
             }
         }
 
