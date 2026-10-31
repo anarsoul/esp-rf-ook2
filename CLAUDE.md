@@ -104,12 +104,34 @@ modules, each owning one concern:
   decoding, and the one part of this codebase with unit tests. Converts a
   `Pulse`/`PulseLevel` pulse-width sample train into a `SensorData` via a
   `packed_struct` bitfield (`NexusTHPayload`), with range/channel/checksum-
-  style validation returning a `DecodeError`. It tolerates up to
-  `MAX_LEADING_JUNK` (2) extra codes ahead of a frame: a slicer-chatter
-  junk pulse from a weak signal, or the partial gap recorded when the RMT
-  was re-armed mid-gap, which shifts every code to (gap, pulse). Both were
-  seen on the board to turn most of a Nexus burst's repeats into 38/39-code
-  trains that a strict 37-code check threw away. `Pulse`/`PulseLevel` are
+  style validation returning a `DecodeError`. It works on the capture as a
+  sequence of level runs and reads bits from rising edge to rising edge:
+  1500 µs is a 0, 2500 µs a 1, within `PERIOD_TOL`. This is what the RXB6
+  on the bench actually delivers: a strong, clean signal whose pulses and
+  gaps are nonetheless chopped by slicer glitches (extra highs of 50-800 µs
+  inside gaps, dropouts inside pulses) and whose first bits after the
+  silence between repeats come through as one long high while the slicer
+  threshold recovers. Edges off the grid are skipped; a lost edge is
+  recovered from the sum of two periods (`classify`), with 4000 µs resolved
+  by `STUCK_HIGH_0` or rejected as `Ambiguous`. A frame is searched for from
+  the capture's first pulse and from any pulse after a `SYNC_MIN` low, not
+  from every pulse, or the receiver's constant chatter (about 70 captures a
+  second with no signal) would yield false frames. The capture ends at the
+  first zero-length run: the RMT's end marker, which reads as a high when
+  the line sat high past the idle threshold, or the zeroed buffer after an
+  overflow. The protocol has no checksum, so the fixed bits are checked
+  instead: the constant nibble at bits 24..27 (always 0xF) and bit 9
+  (always 0). A frame must also be followed by silence: a pulse on the grid
+  after the closing pulse means the frame was started one bit early on a
+  glitch (`StartedEarly`), and the decoder retries from the next pulse. The
+  shifted frame otherwise passes: the bench sensor's reading read one bit
+  early still had 0xF in the constant nibble and appeared as a second
+  sensor, id 105, at 3.8 °C and 100 % humidity, which was published for a
+  while. Humidity up to `HUMIDITY_MAX` (110) is clamped to 100, since the
+  sensor does read a little over 100 when saturated; above that the frame
+  is rejected, as the shift above gives 172 for a reading of 88. Earlier versions
+  trimmed a fixed number of junk codes off the front and classified gap
+  widths; both threw away most repeats. `Pulse`/`PulseLevel` are
   local stand-ins for `esp_hal::rmt::PulseCode`/`esp_hal::gpio::Level` —
   this crate has no `esp_hal` dependency on the host target (only
   target-gated for `xtensa`, to keep the `#[ram]` placement of hot

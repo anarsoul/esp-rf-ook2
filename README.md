@@ -16,6 +16,15 @@ Nexus-TH uses OOK modulation at 433MHz, basic params:
 * zero is 800-1000 uS (no carrier)
 * one is 1650-2150 uS (no carrier)
 
+The decoder reads each bit from its period, one rising edge to the next:
+1500 uS for a zero and 2500 uS for a one, within 200 uS. The RXB6's slicer
+stretches pulses, chops gaps and pulses with glitches, and after the silence
+between repeats stays high through the first short gaps, but the real pulses
+stay on that grid. Edges that land off the grid are skipped as glitches, and
+an edge the receiver lost is recovered from the sum of two periods (3000,
+5000, and 4000 when the stuck high is about 2000 uS long). A frame may start
+at the capture's first pulse or after a low of at least 2200 uS.
+
 Signal looks like:
 ```
    |--|                  |--|       |--|                 |--|                             |--|
@@ -32,11 +41,11 @@ AAAAAAAA BX CC DDDDDDDDDDDD EEEE FFFFFFFF, where:
 
 * A - ID
 * B - 1 if battery is OK, 0 if battery low
-* X - always zero
+* X - always zero; a frame with it set is rejected
 * C - channel, zero based (0 for channel 1)
 * D - temperature * 10 in C. E.g. 123 for 12.3C
-* E - Unknown
-* F - Humidity. Clamp to 100
+* E - always 1111; a frame with anything else is rejected
+* F - Humidity. Up to 110 is clamped to 100, above that the frame is rejected
 
 Set following env variables to specify your credentials for WiFi and MQTT:
 

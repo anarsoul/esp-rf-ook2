@@ -247,12 +247,12 @@ async fn main(spawner: Spawner) -> ! {
         }
 
         // Receive the data as series of PulseCode. For Nexus-TH, it will be
-        // 36 symbols + terminator. High pulse (carrier present) has a fixed width of
-        // 350-650 uS (actual width likely depends on battery voltage),
-        // The actual data is encoded in the lenght of the low pulse (pauses)
-        // 1 is 1650-2150 uS, 0 is 800-1100 uS
+        // 36 symbols + terminator. Each symbol is a carrier pulse of about
+        // 500 us followed by a gap of about 1000 us for a 0 or 2000 us for
+        // a 1; the decoder reads the bit from the period of the two, since
+        // a weak signal moves the edge between them but not the period.
         //
-        // On ESP32 RMT can count the lenght of pulses for us, simplifying the decoding.
+        // On ESP32 RMT can count the length of pulses for us, simplifying the decoding.
         // `receive` starts the hardware before the future is first polled, so
         // the receiver is armed from here on while the previous capture is
         // decoded below.
@@ -269,7 +269,7 @@ async fn main(spawner: Spawner) -> ! {
             None => {}
             Some(Ok(symbol_count)) => {
                 let pulses: [Pulse; 64] = core::array::from_fn(|i| to_pulse(done[i]));
-                match decode(&pulses, 1, symbol_count) {
+                match decode(&pulses[..symbol_count.min(pulses.len())], 1) {
                     Ok(parsed) => {
                         info!(
                             "Temperature: {}{}.{}C, Humidity: {}%",
@@ -282,7 +282,8 @@ async fn main(spawner: Spawner) -> ! {
                         last_decode = Some(Instant::now());
                     }
                     Err(e) => match e {
-                        DecodeError::WrongPayloadLen(_len) => {}
+                        // Most captures are noise blips far short of a frame.
+                        DecodeError::Truncated(_) => {}
                         _ => {
                             warn!("Decode error: {:?}", e);
                         }
