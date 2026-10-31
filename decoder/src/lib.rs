@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 #![cfg_attr(not(test), no_std)]
 
 use packed_struct::prelude::*;

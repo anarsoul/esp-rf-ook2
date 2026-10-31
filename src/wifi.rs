@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Wi-Fi station: keeps the station on the strongest access point of the
 //! configured SSID and runs DHCP only while it is connected.
 //!

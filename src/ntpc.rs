@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 use core::net::SocketAddr;
 use embassy_net::{
     IpAddress, Stack,

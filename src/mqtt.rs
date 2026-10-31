@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 use core::num::NonZero;
 
 use embassy_net::{IpAddress, Stack, dns::DnsQueryType, tcp::TcpSocket};
