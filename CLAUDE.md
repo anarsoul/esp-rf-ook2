@@ -44,6 +44,14 @@ refuses to flash onto an older chip, and `esp_hal::init` asserts it at
 boot. The board this project runs on is an ESP32 v1.0, so the floor is
 lowered; this firmware only ever runs the first core. Do not remove it.
 
+It also sets `ESP_HAL_CONFIG_PLACE_RMT_DRIVER_IN_RAM="true"`, which puts
+esp-hal's RMT receive path (`receive`, the reader, the interrupt handler)
+in IRAM so re-arming the receiver does not wait on flash cache misses.
+The receive loop in `main.rs` (`run`) is deliberately *not* `#[ram]`:
+that attribute only places the function item, which for an `async fn` is
+the stub that builds the future, and the loop body is a coroutine that
+stays in flash whatever the attribute says.
+
 Required env vars at build time (baked in via `env!()` in `src/lib.rs`, so
 missing ones are a hard build failure): `SSID`, `PASSWORD`, `MQTT_SERVER`,
 `MQTT_LOGIN`, `MQTT_PASSWORD`, `MQTT_TOPIC`. Locally these live in `.env`

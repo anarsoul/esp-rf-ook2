@@ -12,13 +12,17 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
+use esp_hal::Async;
 use esp_hal::clock::CpuClock;
+use esp_hal::peripherals::TIMG0;
 use esp_hal::ram;
-use esp_hal::rmt::{CHANNEL_RAM_SIZE, PulseCode, Rmt, RxChannelConfig, RxChannelCreator};
+use esp_hal::rmt::{
+    CHANNEL_RAM_SIZE, Channel as RmtChannel, PulseCode, Rmt, Rx, RxChannelConfig, RxChannelCreator,
+};
 use esp_hal::rng::Rng;
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::time::Rate;
-use esp_hal::timer::timg::{MwdtStage, TimerGroup};
+use esp_hal::timer::timg::{MwdtStage, TimerGroup, Wdt};
 
 use embassy_sync::channel::Channel;
 use embassy_sync::{
@@ -278,85 +282,21 @@ async fn mqtt_publisher(mqtt: &'static mut Mqtt, now: i64) {
     }
 }
 
-#[esp_rtos::main]
-async fn main(spawner: Spawner) -> ! {
-    esp_println::logger::init_logger_from_env();
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let peripherals = esp_hal::init(config);
-
-    // Heap for the Wi-Fi driver and the rest. The reclaimed region is the
-    // largest single block; the second one is headroom for the driver's
-    // buffers and the per-publish allocations.
-    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 72 * 1024);
-    esp_alloc::heap_allocator!(size: 32 * 1024);
-
-    let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
-
-    // Arm watchdog timer
-    let mut wdt = timg0.wdt;
-    wdt.set_timeout(
-        MwdtStage::Stage0,
-        esp_hal::time::Duration::from_millis(30_000),
-    );
-    wdt.enable();
-    wdt.feed();
-
-    let rtc = Rtc::new(peripherals.RTC_TIMER);
-    let wifi =
-        Wifi::new(peripherals.WIFI, Rng::new(), spawner).expect("Failed to initialize Wi-Fi");
-
-    wdt.feed();
-
-    let shared_stack = SHARED_STACK.init(Mutex::new(wifi.stack));
-
-    wdt.feed();
-    let a = wifi.wait_for_ip();
-    let b = Timer::after(Duration::from_secs(20));
-
-    let res = select(a, b).await;
-    match res {
-        Either::First(_) => {
-            info!("Got IP address!");
-        }
-        Either::Second(_) => {
-            panic!("Timed out waiting for IP address");
-        }
-    }
-
-    wdt.feed();
-    let mut ntpc = Ntpc::new(shared_stack);
-
-    let time = ntpc.get_time().await.expect("Failed to get NTP time");
-    rtc.set_current_time_us(time * 1_000_000);
-
+/// The receive loop: captures, decodes, tallies and hands winning bursts
+/// to the publisher. Everything that runs once is in `main`.
+///
+/// Not `#[ram]`: the attribute only sets the link section of the function
+/// item, which for an `async fn` is the stub that builds the future. The
+/// body is a separate coroutine that rustc places in `.text` regardless
+/// (and here inlines into the executor's poll), so it stays in flash.
+async fn run(
+    mut wdt: Wdt<TIMG0<'static>>,
+    rtc: Rtc<'static>,
+    mut ntpc: Ntpc,
+    mut channel: RmtChannel<'static, Async, Rx>,
+) -> ! {
     let mut last_time_sync = Instant::now();
-    let now = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
 
-    info!("now is {now}");
-
-    let freq = Rate::from_mhz(80);
-
-    let rmt = Rmt::new(peripherals.RMT, freq).unwrap().into_async();
-    let rx_config = RxChannelConfig::default()
-        .with_clk_divider(80) // tick will be 1us (1MHz)
-        // A gap this long ends the capture. The longest gap inside a frame
-        // is a 1 bit at about 2150 us and the gap after a frame is at least
-        // 3000 us, so this sits between the two; the lower it is, the sooner
-        // the capture ends and the more of the inter-repeat gap is left to
-        // re-arm the receiver in.
-        .with_idle_threshold(2600)
-        // The glitch filter counts APB clock periods (80 MHz), not channel
-        // ticks, and the register is 8 bits wide, so 255 is the most it can
-        // do: about 3.2 us. Anything longer is left to the decoder.
-        .with_filter_threshold(255)
-        .with_memsize(RX_MEM_BLOCKS);
-
-    let mut channel = rmt
-        .channel0
-        .configure_rx(&rx_config)
-        .expect("Failed to configure RMT RX channel")
-        .with_pin(peripherals.GPIO21);
     // Two capture buffers: the RMT fills one while the other is decoded.
     // Nexus-TH leaves about 4 ms between repeats and the receiver ends a
     // frame 2.6 ms into that gap (the idle threshold above), so the next
@@ -368,12 +308,6 @@ async fn main(spawner: Spawner) -> ! {
     let mut filling = 0usize;
     // Result of the capture that just completed into the other buffer.
     let mut finished: Option<Result<usize, esp_hal::rmt::Error>> = None;
-
-    let mqtt = &mut *mk_static!(Mqtt, Mqtt::new(shared_stack));
-    spawner.spawn(
-        mqtt_publisher(mqtt, rtc.current_time_us() as i64)
-            .expect("Failed to spawn MQTT sender task"),
-    );
 
     // Decodes of the burst in progress, and when the last one arrived.
     // A burst is tallied as a whole once it has gone quiet: the sensor
@@ -510,4 +444,92 @@ async fn main(spawner: Spawner) -> ! {
             Either::Second(_) => finished = None,
         }
     }
+}
+
+#[esp_rtos::main]
+async fn main(spawner: Spawner) -> ! {
+    esp_println::logger::init_logger_from_env();
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    let peripherals = esp_hal::init(config);
+
+    // Heap for the Wi-Fi driver and the rest. The reclaimed region is the
+    // largest single block; the second one is headroom for the driver's
+    // buffers and the per-publish allocations.
+    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 72 * 1024);
+    esp_alloc::heap_allocator!(size: 32 * 1024);
+
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
+
+    // Arm watchdog timer
+    let mut wdt = timg0.wdt;
+    wdt.set_timeout(
+        MwdtStage::Stage0,
+        esp_hal::time::Duration::from_millis(30_000),
+    );
+    wdt.enable();
+    wdt.feed();
+
+    let rtc = Rtc::new(peripherals.RTC_TIMER);
+    let wifi =
+        Wifi::new(peripherals.WIFI, Rng::new(), spawner).expect("Failed to initialize Wi-Fi");
+
+    wdt.feed();
+
+    let shared_stack = SHARED_STACK.init(Mutex::new(wifi.stack));
+
+    wdt.feed();
+    let a = wifi.wait_for_ip();
+    let b = Timer::after(Duration::from_secs(20));
+
+    let res = select(a, b).await;
+    match res {
+        Either::First(_) => {
+            info!("Got IP address!");
+        }
+        Either::Second(_) => {
+            panic!("Timed out waiting for IP address");
+        }
+    }
+
+    wdt.feed();
+    let mut ntpc = Ntpc::new(shared_stack);
+
+    let time = ntpc.get_time().await.expect("Failed to get NTP time");
+    rtc.set_current_time_us(time * 1_000_000);
+
+    let now = jiff::Timestamp::from_microsecond(rtc.current_time_us() as i64).unwrap();
+
+    info!("now is {now}");
+
+    let freq = Rate::from_mhz(80);
+
+    let rmt = Rmt::new(peripherals.RMT, freq).unwrap().into_async();
+    let rx_config = RxChannelConfig::default()
+        .with_clk_divider(80) // tick will be 1us (1MHz)
+        // A gap this long ends the capture. The longest gap inside a frame
+        // is a 1 bit at about 2150 us and the gap after a frame is at least
+        // 3000 us, so this sits between the two; the lower it is, the sooner
+        // the capture ends and the more of the inter-repeat gap is left to
+        // re-arm the receiver in.
+        .with_idle_threshold(2600)
+        // The glitch filter counts APB clock periods (80 MHz), not channel
+        // ticks, and the register is 8 bits wide, so 255 is the most it can
+        // do: about 3.2 us. Anything longer is left to the decoder.
+        .with_filter_threshold(255)
+        .with_memsize(RX_MEM_BLOCKS);
+
+    let channel = rmt
+        .channel0
+        .configure_rx(&rx_config)
+        .expect("Failed to configure RMT RX channel")
+        .with_pin(peripherals.GPIO21);
+
+    let mqtt = &mut *mk_static!(Mqtt, Mqtt::new(shared_stack));
+    spawner.spawn(
+        mqtt_publisher(mqtt, rtc.current_time_us() as i64)
+            .expect("Failed to spawn MQTT sender task"),
+    );
+
+    run(wdt, rtc, ntpc, channel).await
 }

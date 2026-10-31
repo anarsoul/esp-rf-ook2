@@ -15,6 +15,13 @@ ESP_LOG="info"
 # failure. The board in use is an ESP32 v1.0. With the floor at 0 esp-hal
 # reads the revision from efuse at run time to pick its errata workarounds.
 ESP_HAL_CONFIG_MIN_CHIP_REVISION="0"
+# Place the RMT driver (receive start, reader, interrupt handler) in IRAM.
+# The receiver is dead from the end of a capture until the loop re-arms
+# it, and Nexus-TH leaves about 1.4 ms for that, so the driver code on
+# that path should not stall on flash cache misses. The receive loop
+# itself cannot be moved: `#[ram]` on an async fn only places the stub
+# that builds the future, the body is a coroutine that stays in flash.
+ESP_HAL_CONFIG_PLACE_RMT_DRIVER_IN_RAM="true"
 
 # Run the decoder crate's unit tests on the host. Must be invoked as
 # `cargo +stable test-decoder`: the `[unstable]` build-std below is
