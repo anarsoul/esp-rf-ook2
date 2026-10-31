@@ -155,7 +155,3 @@ The hardware watchdog (`Mwdt`, 30s timeout) is fed (`wdt.feed()`) at each
 loop iteration and around blocking operations; the `mqtt_publisher` task
 deliberately `panic!`s if no publish has succeeded in 5 minutes so the
 watchdog resets the device rather than running silently degraded.
-
-`radium-0.7.0/` is a vendored crate pulled in via `[patch.crates-io]` in
-`Cargo.toml` — not part of this project's own code, don't edit it as if it
-were.

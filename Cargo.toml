@@ -82,5 +82,3 @@ lto              = 'fat'
 opt-level        = 's'
 overflow-checks  = false
 
-[patch.crates-io]
-radium = { path = "radium-0.7.0" }
