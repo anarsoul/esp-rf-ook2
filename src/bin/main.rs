@@ -39,6 +39,8 @@ use embassy_net::Stack;
 use static_cell::StaticCell;
 
 use alloc::format;
+use alloc::string::String;
+use core::fmt::Write as _;
 
 extern crate alloc;
 
@@ -74,6 +76,130 @@ const BURST_GAP: Duration = Duration::from_secs(2);
 const RX_MEM_BLOCKS: u8 = 4;
 /// Codes one capture can hold, and the size of each capture buffer.
 const RX_CODES: usize = RX_MEM_BLOCKS as usize * CHANNEL_RAM_SIZE;
+
+/// A capture at least this long that fails to decode is logged at debug
+/// level with its error and codes: it is most of a frame. Shorter captures
+/// are noise blips and are only counted. Nothing per capture goes out at
+/// info: the console runs at 115200 baud, printing blocks this task, and
+/// the receiver is dead from the end of a capture until this task re-arms
+/// it. With the RXB6 chattering through 70 captures a second, a line per
+/// capture cost enough dead time to miss the start of repeats.
+const DUMP_MIN_CODES: usize = 20;
+
+/// The receiver is never quiet, so the tally is also logged this often
+/// while no burst is in progress: once per transmission interval.
+const TALLY_PERIOD: Duration = Duration::from_secs(60);
+
+/// What became of every capture. Logged when a burst closes, and once a
+/// minute otherwise, so the repeats that never turned into a decode are
+/// accounted for instead of vanishing: a burst showing one decode and no
+/// errors was losing the other eleven to captures nobody logged.
+#[derive(Default)]
+struct Tally {
+    captures: u32,
+    decoded: u32,
+    truncated: u32,
+    off_grid: u32,
+    ambiguous: u32,
+    bad_constant: u32,
+    shifted: u32,
+    other: u32,
+    rmt_errors: u32,
+}
+
+impl Tally {
+    fn is_empty(&self) -> bool {
+        self.captures == 0
+    }
+
+    fn decoded(&mut self) {
+        self.captures += 1;
+        self.decoded += 1;
+    }
+
+    fn failed(&mut self, err: &DecodeError) {
+        self.captures += 1;
+        match err {
+            DecodeError::Truncated(_) => self.truncated += 1,
+            DecodeError::PeriodOutOfRange(..) => self.off_grid += 1,
+            DecodeError::Ambiguous(..) => self.ambiguous += 1,
+            DecodeError::BadConstant(_)
+            | DecodeError::ReservedBitSet
+            | DecodeError::HumidityOutOfRange(_) => self.bad_constant += 1,
+            DecodeError::StartedEarly => self.shifted += 1,
+            _ => self.other += 1,
+        }
+    }
+
+    /// An RMT error is counted on top of what its data then decodes to.
+    fn rmt_error(&mut self) {
+        self.rmt_errors += 1;
+    }
+}
+
+impl core::fmt::Display for Tally {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{} captures: {} decoded, {} truncated, {} off grid, {} ambiguous, \
+             {} bad payload, {} started early, {} other; {} RMT errors",
+            self.captures,
+            self.decoded,
+            self.truncated,
+            self.off_grid,
+            self.ambiguous,
+            self.bad_constant,
+            self.shifted,
+            self.other,
+            self.rmt_errors
+        )
+    }
+}
+
+/// A reading as `7.6C 88% id 211 battery ok`.
+fn describe(data: &SensorData) -> String {
+    format!(
+        "{}{}.{}C {}% id {} battery {}",
+        if data.sign < 0 { "-" } else { "" },
+        data.temp_int,
+        data.temp_decimal,
+        data.humidity,
+        data.id,
+        if data.battery_ok { "ok" } else { "low" }
+    )
+}
+
+/// Codes in a capture buffer up to and including the one holding the end
+/// marker, or all of them if it overflowed without one.
+fn codes_in(buffer: &[PulseCode]) -> usize {
+    buffer
+        .iter()
+        .position(|c| c.length1() == 0 || c.length2() == 0)
+        .map_or(buffer.len(), |i| i + 1)
+}
+
+/// The codes of a capture as `H480/L950 H500/L1900 ...`, one entry per
+/// code, levels as H/L and lengths in microseconds.
+fn format_codes(codes: &[PulseCode]) -> String {
+    fn level(l: esp_hal::gpio::Level) -> char {
+        match l {
+            esp_hal::gpio::Level::Low => 'L',
+            esp_hal::gpio::Level::High => 'H',
+        }
+    }
+    let mut out = String::with_capacity(codes.len() * 12);
+    for c in codes {
+        let _ = write!(
+            out,
+            " {}{}/{}{}",
+            level(c.level1()),
+            c.length1(),
+            level(c.level2()),
+            c.length2()
+        );
+    }
+    out
+}
 
 static MQTT_CHANNEL: Channel<CriticalSectionRawMutex, (SensorData, i64), 2> = Channel::new();
 
@@ -111,7 +237,7 @@ async fn mqtt_publisher(mqtt: &'static mut Mqtt, now: i64) {
             panic!("No successful publishes in 300 seconds!");
         }
 
-        info!("Publishing...");
+        debug!("Publishing...");
         let date_time = jiff::Timestamp::from_microsecond(timestamp)
             .unwrap()
             .strftime("%Y-%m-%d %H:%M:%S UTC");
@@ -248,6 +374,9 @@ async fn main(spawner: Spawner) -> ! {
     // trusted on its own and one corrupt decode must not veto the rest.
     let mut vote = Vote::default();
     let mut last_decode: Option<Instant> = None;
+    // Every capture's fate, and when it was last logged.
+    let mut tally = Tally::default();
+    let mut last_tally = Instant::now();
 
     loop {
         wdt.feed();
@@ -290,52 +419,63 @@ async fn main(spawner: Spawner) -> ! {
         // driver has copied what the hardware got before giving up, and it
         // may well hold a frame.
         if let Some(result) = finished.take() {
+            let count = codes_in(done);
             if let Err(e) = result {
-                // Overflows and framing errors on a noisy line are routine;
-                // keep them out of the default log.
-                debug!("RMT receive error: {e:?}");
+                tally.rmt_error();
+                debug!("RMT receive error: {e:?}, {count} codes");
             }
             let pulses: [Pulse; RX_CODES] = core::array::from_fn(|i| to_pulse(done[i]));
             match decode(&pulses, 1) {
                 Ok(parsed) => {
-                    info!(
-                        "Temperature: {}{}.{}C, Humidity: {}%",
-                        { if parsed.sign < 0 { "-" } else { "" } },
-                        parsed.temp_int,
-                        parsed.temp_decimal,
-                        parsed.humidity
-                    );
+                    // Nothing is printed here: the burst is reported as a
+                    // whole once it is over, see BURST_GAP. A line per decode
+                    // cost dead time in the middle of the burst.
+                    debug!("Decoded {}", describe(&parsed));
+                    tally.decoded();
                     vote.add(parsed);
                     last_decode = Some(Instant::now());
                 }
-                Err(e) => match e {
-                    // Most captures are noise blips far short of a frame.
-                    DecodeError::Truncated(_) => {}
-                    _ => {
-                        warn!("Decode error: {:?}", e);
+                Err(e) => {
+                    tally.failed(&e);
+                    if count >= DUMP_MIN_CODES {
+                        debug!("{count} codes, {e:?}:{}", format_codes(&done[..count]));
                     }
-                },
+                }
             }
         }
 
         // The burst is over once no decode has arrived for BURST_GAP;
         // this runs at least once a second thanks to the timeout below.
-        if let Some(since) = last_decode
-            && since.elapsed() > BURST_GAP
-        {
+        let quiet_for = |t: Option<Instant>| t.is_some_and(|since| since.elapsed() > BURST_GAP);
+        if quiet_for(last_decode) {
+            // The one line per burst: its outcome, and the tally since the
+            // last line, which holds the burst's own captures.
             match vote.winner() {
                 Some(data) => {
+                    info!(
+                        "Burst: {} decodes, {}; {tally}",
+                        vote.decodes(),
+                        describe(&data)
+                    );
                     MQTT_CHANNEL
                         .send((data, rtc.current_time_us() as i64))
                         .await;
                 }
                 None => warn!(
-                    "Burst of {} decode(s) had no two in agreement, dropped",
+                    "Burst: {} decode(s), no two in agreement, dropped; {tally}",
                     vote.decodes()
                 ),
             }
+            tally = Tally::default();
+            last_tally = Instant::now();
             vote.clear();
             last_decode = None;
+        } else if last_decode.is_none() && last_tally.elapsed() > TALLY_PERIOD {
+            if !tally.is_empty() {
+                info!("Tally: {tally}");
+            }
+            tally = Tally::default();
+            last_tally = Instant::now();
         }
 
         match select(a, b).await {
