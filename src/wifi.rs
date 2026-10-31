@@ -43,10 +43,12 @@ use crate::{PASSWORD, SSID};
 const HOSTNAME: &str = "esp-rf-ook2";
 
 /// Transmit power ceiling in quarter dBm. esp-radio starts the radio at 20
-/// (5 dBm), far below ESP-IDF's 80 (20 dBm) default; 68 (17 dBm) is the
-/// value esp32clock measured as the knee on its board. Raise it towards 80
-/// if the serial log shows the AP hearing us much weaker than we hear it.
-pub const WIFI_MAX_TX_POWER_QDBM: i8 = 68;
+/// (5 dBm), far below ESP-IDF's 80 (20 dBm) default. This board has a
+/// proper antenna and hears the AP at about -30 dBm, and published fine at
+/// the 5 dBm default; 40 (10 dBm) leaves margin for moving it. esp32clock
+/// needs 68 (17 dBm) because of its ceramic antenna; esp-radio warns that
+/// values above about 65 cause authentication failures on some boards.
+pub const WIFI_MAX_TX_POWER_QDBM: i8 = 40;
 
 /// Frames the driver queues for the network stack before it drops new
 /// ones. esp-radio's default of 5 overflowed on bursts of LAN broadcasts
